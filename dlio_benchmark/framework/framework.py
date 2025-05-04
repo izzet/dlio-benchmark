@@ -45,14 +45,24 @@ class Framework(ABC):
     def __init__(self):
         self.args = ConfigArguments.get_instance()
         self.output_folder = self.args.output_folder
+        # Store format/loader types needed by the factory
+        self._format_type = self.args.format # Assuming args is ready
+        self._data_loader_type = self.args.data_loader # Assuming args is ready
+        self.storage = None # Initialize storage later
 
 
     @abstractmethod
     def init_loader(self, format_type, epoch, data_loader=None):
-        self.reader_train = DataLoaderFactory.get_loader(data_loader, format_type,
-                                                         dataset_type=DatasetType.TRAIN, epoch=epoch)
-        self.reader_valid = DataLoaderFactory.get_loader(data_loader, format_type,
-                                                         dataset_type=DatasetType.VALID, epoch=epoch)
+        # self.reader_train = DataLoaderFactory.get_loader(data_loader, format_type,
+        #                                                  dataset_type=DatasetType.TRAIN, epoch=epoch)
+        # self.reader_valid = DataLoaderFactory.get_loader(data_loader, format_type,
+        #                                                  dataset_type=DatasetType.VALID, epoch=epoch)
+        self._format_type = format_type
+        if data_loader is None:
+            # Use default from args if not provided
+            self._data_loader_type = self.args.data_loader
+        else:
+            self._data_loader_type = data_loader
         self.storage = StorageFactory().get_storage(self.args.storage_type, self.args.storage_root, self.args.framework)
 
     @abstractmethod 
@@ -79,8 +89,14 @@ class Framework(ABC):
         pass
 
     @abstractmethod
-    def get_loader(self, dataset_type):
-        pass
+    def get_loader(self, dataset_type, epoch):
+        # pass
+        return DataLoaderFactory.get_loader(
+            type=self._data_loader_type,
+            format_type=self._format_type,
+            dataset_type=dataset_type,
+            epoch=epoch
+        )
 
     @abstractmethod
     def is_nativeio_available(self):

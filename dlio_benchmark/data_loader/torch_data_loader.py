@@ -1,19 +1,20 @@
 """
-   Copyright (c) 2025, UChicago Argonne, LLC
-   All Rights Reserved
+Copyright (c) 2025, UChicago Argonne, LLC
+All Rights Reserved
 
-   Licensed under the Apache License, Version 2.0 (the "License");
-   you may not use this file except in compliance with the License.
-   You may obtain a copy of the License at
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
 
-       http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
-   Unless required by applicable law or agreed to in writing, software
-   distributed under the License is distributed on an "AS IS" BASIS,
-   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-   See the License for the specific language governing permissions and
-   limitations under the License.
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
 """
+
 from time import time
 import logging
 import math
@@ -41,7 +42,9 @@ class TorchDataset(Dataset):
     """
 
     @dlp.log_init
-    def __init__(self, format_type, dataset_type, epoch, num_samples, num_workers, batch_size):
+    def __init__(
+        self, format_type, dataset_type, epoch, num_samples, num_workers, batch_size
+    ):
         self.format_type = format_type
         self.dataset_type = dataset_type
         self.epoch_number = epoch
@@ -62,11 +65,15 @@ class TorchDataset(Dataset):
         _args = ConfigArguments.get_instance()
         _args.configure_dlio_logging(is_child=True)
         self.dlp_logger = _args.configure_dftracer(is_child=True, use_pid=True)
-        self.logger.debug(f"{utcnow()} worker initialized {worker_id} with format {self.format_type}")
-        self.reader = ReaderFactory.get_reader(type=self.format_type,
-                                               dataset_type=self.dataset_type,
-                                               thread_index=worker_id,
-                                               epoch_number=self.epoch_number)
+        self.logger.debug(
+            f"{utcnow()} worker initialized {worker_id} with format {self.format_type}"
+        )
+        self.reader = ReaderFactory.get_reader(
+            type=self.format_type,
+            dataset_type=self.dataset_type,
+            thread_index=worker_id,
+            epoch_number=self.epoch_number,
+        )
 
     def __del__(self):
         if self.dlp_logger:
@@ -80,8 +87,10 @@ class TorchDataset(Dataset):
     def __getitem__(self, image_idx):
         self.num_images_read += 1
         step = int(math.ceil(self.num_images_read / self.batch_size))
-        self.logger.debug(f"{utcnow()} Rank {DLIOMPI.get_instance().rank()} reading {image_idx} sample")
-        dlp.update(step = step)
+        self.logger.debug(
+            f"{utcnow()} Rank {DLIOMPI.get_instance().rank()} reading {image_idx} sample"
+        )
+        dlp.update(step=step)
         return self.reader.read_index(image_idx, step)
 
 
@@ -91,13 +100,12 @@ class dlio_sampler(Sampler):
         self.rank = rank
         self.num_samples = num_samples
         self.epochs = epochs
-        samples_per_proc = int(math.ceil(num_samples/size)) 
+        samples_per_proc = int(math.ceil(num_samples / size))
         start_sample = self.rank * samples_per_proc
         end_sample = (self.rank + 1) * samples_per_proc - 1
         if end_sample > num_samples - 1:
             end_sample = num_samples - 1
         self.indices = list(range(start_sample, end_sample + 1))
-
 
     def __len__(self):
         return self.num_samples
@@ -110,20 +118,26 @@ class dlio_sampler(Sampler):
 class TorchDataLoader(BaseDataLoader):
     @dlp.log_init
     def __init__(self, format_type, dataset_type, epoch_number):
-        super().__init__(format_type, dataset_type, epoch_number, DataLoaderType.PYTORCH)
+        super().__init__(
+            format_type, dataset_type, epoch_number, DataLoaderType.PYTORCH
+        )
+
     @dlp.log
     def read(self):
         dataset = TorchDataset(self.format_type, self.dataset_type, self.epoch_number, self.num_samples,
                                self._args.read_threads, self.batch_size)
         sampler = dlio_sampler(self._args.my_rank, self._args.comm_size, self.num_samples, self._args.epochs)
         if self._args.read_threads >= 1:
-            prefetch_factor = math.ceil(self._args.prefetch_size / self._args.read_threads)
+            prefetch_factor = math.ceil(
+                self._args.prefetch_size / self._args.read_threads
+            )
         else:
             prefetch_factor = self._args.prefetch_size
         if prefetch_factor > 0:
             if self._args.my_rank == 0:
-                self.logger.debug(
-                    f"{utcnow()} Prefetch size is {self._args.prefetch_size}; prefetch factor of {prefetch_factor} will be set to Torch DataLoader.")
+                self.logger.output(
+                    f"{utcnow()} Prefetch size is {self._args.prefetch_size}; prefetch factor of {prefetch_factor} will be set to Torch DataLoader."
+                )
         else:
             prefetch_factor = 2
             if self._args.my_rank == 0:
@@ -133,44 +147,100 @@ class TorchDataLoader(BaseDataLoader):
         if self._args.read_threads==0:
             kwargs={}
         else:
-            kwargs={'multiprocessing_context':self._args.multiprocessing_context,
-                    'prefetch_factor': prefetch_factor}
-            if torch.__version__ != '1.3.1':       
-                kwargs['persistent_workers'] = True
-        if torch.__version__ == '1.3.1':
-            if 'prefetch_factor' in kwargs:
-                del kwargs['prefetch_factor']
-            self._dataset = DataLoader(dataset,
-                                       batch_size=self.batch_size,
-                                       sampler=sampler,
-                                       num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
-                                       drop_last=True,
-                                       worker_init_fn=dataset.worker_init, 
-                                       **kwargs)
-        else: 
-            self._dataset = DataLoader(dataset,
-                                       batch_size=self.batch_size,
-                                       sampler=sampler,
-                                       num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
-                                       drop_last=True,
-                                       worker_init_fn=dataset.worker_init,
-                                       **kwargs)  # 2 is the default value
-        self.logger.debug(f"{utcnow()} Rank {self._args.my_rank} will read {len(self._dataset) * self.batch_size} files")
+            kwargs = {
+                "multiprocessing_context": self._args.multiprocessing_context,
+                "prefetch_factor": prefetch_factor,
+            }
+            if torch.__version__ != "1.3.1":
+                kwargs["persistent_workers"] = True
+        if torch.__version__ == "1.3.1":
+            if "prefetch_factor" in kwargs:
+                del kwargs["prefetch_factor"]
+            self._dataset = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                sampler=None if isinstance(dataset, IterableDataset) else sampler,
+                num_workers=self._args.read_threads,
+                pin_memory=self._args.pin_memory,
+                drop_last=True,
+                worker_init_fn=dataset.worker_init
+                if hasattr(dataset, "worker_init")
+                else None,
+                **kwargs,
+            )
+        else:
+            self._dataset = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                sampler=None if isinstance(dataset, IterableDataset) else sampler,
+                num_workers=self._args.read_threads,
+                pin_memory=self._args.pin_memory,
+                drop_last=True,
+                worker_init_fn=dataset.worker_init
+                if hasattr(dataset, "worker_init")
+                else None,
+                **kwargs,
+            )  # 2 is the default value
+        
+        self.logger.output(f"TorchDataLoader instance {id(self)} initialized for epoch {self.epoch_number}, read() completed.")
+
+        # self.logger.debug(
+        #     f"{utcnow()} Rank {self._args.my_rank} will read {len(self._dataset) * self.batch_size} files"
+        # )
 
         # self._dataset.sampler.set_epoch(epoch_number)
+        # if self._args.read_threads > 0 and not isinstance(dataset, IterableDataset):
+        #     try:
+        #         self.logger.output(
+        #             f"{utcnow()} Prefetching the first batch of data to avoid delay in the first iteration."
+        #         )
+        #         _ = next(iter(self._dataset))  # Prime the first batch
+        #         if self._args.comm_size > 1:
+        #             DLIOMPI.get_instance().comm().barrier()
+        #     except Exception as e:
+        #         self.logger.warning(f"Initial batch prefetch failed: {e}")
+
+        # if self._args.read_threads > 0 and not isinstance(dataset, IterableDataset):
+        #     dataset._warmup = True
+        #     try:
+        #         dummy_loader = DataLoader(
+        #             dataset,
+        #             batch_size=1,  # Minimal effort
+        #             num_workers=self._args.read_threads,
+        #             prefetch_factor=1,  # Avoid extra data pull
+        #             persistent_workers=False,
+        #             pin_memory=self._args.pin_memory,
+        #             worker_init_fn=dataset.worker_init if hasattr(dataset, "worker_init") else None,
+        #         )
+        #         _ = next(iter(dummy_loader))  # Triggers actual work
+        #         self.logger.output(f"{utcnow()} Prefetched first batch (safely with next(iter)).")
+        #         # self.logger.output(f"{utcnow()} Warmup done: DataLoader workers initialized.")
+        #     except Exception as e:
+        #         self.logger.warning(f"Warmup prefetch failed: {e}")
+        #     finally:
+        #         dataset._warmup = False
 
     @dlp.log
     def next(self):
         super().next()
-        total = self._args.training_steps if self.dataset_type is DatasetType.TRAIN else self._args.eval_steps
-        self.logger.debug(f"{utcnow()} Rank {self._args.my_rank} should read {total} batches")
+        total = (
+            self._args.training_steps
+            if self.dataset_type is DatasetType.TRAIN
+            else self._args.eval_steps
+        )
+        self.logger.debug(
+            f"{utcnow()} Rank {self._args.my_rank} should read {total} batches"
+        )
         step = 1
-        # TODO: @hariharan-devarajan: change below line when we bump the dftracer version to 
+
+        if not hasattr(self, '_dataset') or self._dataset is None:
+            self.logger.warning(f"DataLoader for epoch {self.epoch_number}: _dataset not initialized before next(), calling read().")
+            self.read()
+
+        # TODO: @hariharan-devarajan: change below line when we bump the dftracer version to
         #       `dlp.iter(self._dataset, name=self.next.__qualname__)`
         for batch in dlp.iter(self._dataset):
-            dlp.update(step = step)
+            dlp.update(step=step)
             step += 1
             yield batch
         self.epoch_number += 1
@@ -178,4 +248,9 @@ class TorchDataLoader(BaseDataLoader):
 
     @dlp.log
     def finalize(self):
+        self.logger.info(f"TorchDataLoader instance {id(self)} for epoch {self.epoch_number}: Finalizing.")
+        # Add any specific cleanup needed for this instance
+        # e.g., explicitly delete self._dataset maybe?
+        # if hasattr(self, '_dataset'):
+        #     del self._dataset
         pass

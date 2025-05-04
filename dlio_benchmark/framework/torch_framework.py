@@ -97,11 +97,12 @@ class TorchFramework(Framework):
         return self.model(batch, computation_time)
 
     @dlp.log
-    def get_loader(self, dataset_type=DatasetType.TRAIN):
-        if dataset_type == DatasetType.TRAIN:
-            return self.reader_train
-        else:
-            return self.reader_valid
+    def get_loader(self, dataset_type, epoch):
+        return super().get_loader(dataset_type, epoch)
+        # if dataset_type == DatasetType.TRAIN:
+        #     return self.reader_train
+        # else:
+        #     return self.reader_valid
 
     @dlp.log
     def is_nativeio_available(self):

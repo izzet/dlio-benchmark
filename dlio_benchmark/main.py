@@ -14,12 +14,15 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
+import itertools as it
 import os
 import math
 import logging
 from time import time
 import json
 import numpy as np
+import threading
+import queue
 
 # Reduce TF and CUDA logging
 from numpy import random
@@ -54,6 +57,134 @@ import hydra
 dftracer_initialize = True
 dftracer_finalize   = True
 dtracer             = None
+
+
+class SimplePrefetcher:
+    def __init__(self, benchmark_instance):
+        """
+        Initializes the prefetcher.
+        Args:
+            benchmark_instance: A reference to the DLIOBenchmark instance
+                                to access methods like framework.get_loader.
+        """
+        self._benchmark = benchmark_instance
+        self._queue = queue.Queue(maxsize=1)
+        self._worker_thread = None
+        self._is_running = False
+        self._prefetched_epoch = -1
+        self.logger = DLIOLogger.get_instance() # Use the benchmark's logger
+
+    def _worker(self, epoch_to_prefetch):
+        """The function run by the background thread."""
+        result_batch = None
+        result_iterator = None
+        result_error = None
+        loader = None # Keep track of loader instance for potential cleanup
+        try:
+            self.logger.debug(f"[Prefetcher] Worker started for epoch {epoch_to_prefetch}")
+
+            # --- Get loader SPECIFICALLY for the target epoch ---
+            # This now relies on the modified framework interface
+            loader = self._benchmark.framework.get_loader(DatasetType.TRAIN, epoch=epoch_to_prefetch)
+            if loader is None:
+                 raise ValueError(f"Framework failed to provide a loader for epoch {epoch_to_prefetch}")
+
+            # --- Read data using the loader ---
+            # We need the loader to actually prepare itself if needed (like calling .read())
+            # Let's assume .read() prepares the internal state based on the epoch given at init
+            loader.read() # Make sure loader is ready
+
+            result_iterator = loader.next() # Get the iterator
+            self.logger.debug(f"[Prefetcher] Worker obtained iterator for epoch {epoch_to_prefetch}")
+            result_batch = next(result_iterator)
+            self.logger.info(f"[Prefetcher] Worker successfully prefetched batch for epoch {epoch_to_prefetch}")
+
+        except StopIteration:
+            self.logger.warning(f"[Prefetcher] Worker found empty dataset for epoch {epoch_to_prefetch}")
+            result_error = StopIteration()
+        except Exception as e:
+            self.logger.error(f"[Prefetcher] Worker failed for epoch {epoch_to_prefetch}: {e}", exc_info=True)
+            result_error = e
+        finally:
+            # Always put a result on the queue
+            self._queue.put((result_batch, result_iterator, result_error, epoch_to_prefetch, loader))
+            self.logger.debug(f"[Prefetcher] Worker finished and put result on queue for epoch {epoch_to_prefetch}")
+
+            # Attempt cleanup? Risky in thread. DataLoader __del__ should handle it.
+            # If loader has explicit cleanup, consider calling it, but beware thread safety.
+            # loader.finalize() # Maybe? Check finalize implementation. Original was pass.
+
+
+    def start_prefetch_for_epoch(self, epoch_to_prefetch):
+        """Starts the background prefetch for the given epoch number."""
+        if self._is_running:
+            self.logger.warning(f"[Prefetcher] Request to prefetch epoch {epoch_to_prefetch} ignored, already prefetching epoch {self._prefetched_epoch}")
+            return
+
+        self.logger.info(f"[Prefetcher] Starting prefetch thread for epoch {epoch_to_prefetch}...")
+        self._prefetched_epoch = epoch_to_prefetch
+        self._is_running = True
+        while not self._queue.empty():
+            try: self._queue.get_nowait()
+            except queue.Empty: break
+
+        self._worker_thread = threading.Thread(target=self._worker, args=(epoch_to_prefetch,))
+        self._worker_thread.daemon = True
+        self._worker_thread.start()
+
+    def get_prefetched_result(self, expected_epoch):
+        """
+        Checks non-blockingly for a prefetched result for the expected epoch.
+
+        Returns:
+            tuple: (batch, iterator) if successful and for the correct epoch.
+            None: If no result ready, wrong epoch, or an error occurred during prefetch.
+        """
+        if not self._is_running:
+            self.logger.debug(f"[Prefetcher] Attempted to get result for epoch {expected_epoch}, but not running.")
+            return None # Prefetch wasn't running
+
+        pref_batch, pref_iter, pref_error, pref_epoch, pref_loader = (None, None, None, -1, None)
+        try:
+            # Check the queue without blocking
+            pref_batch, pref_iter, pref_error, pref_epoch, pref_loader = self._queue.get_nowait()
+            self.logger.debug(f"[Prefetcher] Got result from queue for epoch {pref_epoch}. Expecting {expected_epoch}.")
+            # We got something, so the worker is done. Reset state.
+            self._is_running = False
+            self._worker_thread = None # Let thread be garbage collected if it exited
+            self._prefetched_epoch = -1
+
+        except queue.Empty:
+            # No result ready yet.
+            self.logger.debug(f"[Prefetcher] No result ready yet in queue for epoch {expected_epoch}.")
+            return None
+
+        # Check if the result is for the epoch we actually need
+        if pref_epoch != expected_epoch:
+            self.logger.warning(f"[Prefetcher] Discarding stale prefetched result for epoch {pref_epoch} (expected {expected_epoch})")
+            # Cleanup iterator if needed? Depends on DataLoader specifics.
+            # If pref_iter holds resources, this could leak.
+            # However, letting it go out of scope might be enough.
+            return None
+
+        # Check if an error occurred during prefetch
+        if pref_error:
+            self.logger.error(f"[Prefetcher] Prefetch for epoch {expected_epoch} failed with error: {pref_error}")
+            return None
+
+        # Success!
+        self.logger.info(f"[Prefetcher] Successfully retrieved prefetched batch for epoch {expected_epoch}")
+        return pref_batch, pref_iter, pref_loader
+
+    def shutdown(self):
+        """Optional: Cleanly handle shutdown if needed."""
+        # If using daemon threads, they might just exit.
+        # If not daemon, you might want to signal the worker to stop
+        # and potentially wait briefly, but avoid indefinite join.
+        self.logger.info("[Prefetcher] Shutdown requested.")
+        # Since we don't join actively, there's not much to do here unless
+        # we implement a cancellation mechanism for the worker.
+
 
 class DLIOBenchmark(object):
     """
@@ -151,6 +282,7 @@ class DLIOBenchmark(object):
             self.eval_after_epoch = self.args.eval_after_epoch
             self.epochs_between_evals = self.args.epochs_between_evals
         self.stats = StatsCounter()
+        self.prefetcher = SimplePrefetcher(self)
 
     @dlp.log
     def initialize(self):
@@ -309,7 +441,7 @@ class DLIOBenchmark(object):
         if self.comm.rank == 0:
             self.logger.output(f"{utcnow()} Checkpointing write started")
     @dlp.log
-    def _train(self, epoch):
+    def _train(self, epoch, loader_iter=None, loader_instance=None):
         """
         Training loop for reading the dataset and performing training computations.
         :return: returns total steps.
@@ -320,9 +452,36 @@ class DLIOBenchmark(object):
         self.steps_per_epoch = max_steps
         # Start the very first block
         self.stats.start_block(epoch, block)
-        loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN)
+
+        # loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN)
         self.stats.start_loading()
-        for batch in loader.next():
+
+
+        managed_loader = loader_instance
+        if loader_iter is None:
+            self.logger.debug(f"Epoch {epoch}: No pre-made iterator/loader provided, creating fresh loader.")
+            # Get a new loader instance for the current epoch
+            managed_loader = self.framework.get_loader(DatasetType.TRAIN, epoch=epoch)
+            if managed_loader is None:
+                raise RuntimeError(f"Failed to get loader for epoch {epoch}")
+            managed_loader.read() # Ensure loader is ready
+            loader_iter = managed_loader.next()
+            self.logger.debug(f"Epoch {epoch}: Created fresh loader instance {id(managed_loader)}.")
+        else:
+            self.logger.debug(f"Epoch {epoch}: Using provided iterator and loader instance {id(managed_loader)}.")
+
+        for batch in loader_iter:
+            PREFETCH_LOOKAHEAD = 1
+            is_last_epoch = (epoch == self.epochs)
+            should_prefetch = (overall_step == max(1, max_steps - PREFETCH_LOOKAHEAD + 1))
+            if should_prefetch and not is_last_epoch:
+                next_epoch = epoch + 1
+                self.logger.info(f"Epoch {epoch}, Step {overall_step}: Triggering prefetch for epoch {next_epoch}.")
+                # Check if already running (defensive, start_prefetch handles this too)
+                if not self.prefetcher._is_running:
+                    self.prefetcher.start_prefetch_for_epoch(next_epoch)
+                else:
+                    self.logger.warning(f"Epoch {epoch}, Step {overall_step}: Prefetcher busy, skipping trigger for {next_epoch}.")
             self.stats.batch_loaded(epoch, overall_step, block)
             computation_time = self.args.computation_time
             if (isinstance(computation_time, dict) and len(computation_time) > 0) or (isinstance(computation_time, float) and  computation_time > 0):
@@ -363,6 +522,7 @@ class DLIOBenchmark(object):
             self.checkpointing_mechanism.save_checkpoint(epoch, overall_step)
             self.stats.end_save_ckpt(epoch, block)
             self.next_checkpoint_epoch += self.epochs_between_checkpoints
+        self.logger.output(f"{utcnow()} [Rank {self.my_rank}] Epoch {epoch} - _train returning step count: {overall_step}")
         return overall_step
 
     @dlp.log
@@ -395,24 +555,38 @@ class DLIOBenchmark(object):
             # Initialize the dataset
             self.args.reconfigure(epoch)
             self.framework.init_loader(self.args.format, epoch=epoch, data_loader=self.args.data_loader)
-            self.framework.get_loader(dataset_type=DatasetType.TRAIN).read()
+            # self.framework.get_loader(dataset_type=DatasetType.TRAIN).read()
             if self.do_eval:
-                self.framework.get_loader(dataset_type=DatasetType.VALID).read()
+                self.framework.get_loader(DatasetType.VALID, epoch).read()
+            next_loader_iter = None  # nothing for first epoch
             for epoch in range(1, self.epochs + 1):
                 self.stats.start_epoch(epoch)
+                prefetched_loader_instance = None # Track loader from prefetcher
+                if epoch == 1:
+                    next_loader_iter = None # No prefetch for first epoch
+                else:
+                    prefetched_data = self.prefetcher.get_prefetched_result(epoch)
+                    if prefetched_data:
+                        first_batch, rest_iter, prefetched_loader_instance = prefetched_data # Unpack loader
+                        next_loader_iter = it.chain([first_batch], rest_iter)
+                        self.logger.info(f"Epoch {epoch}: Using prefetched data with loader {id(prefetched_loader_instance)}.")
+                    else:
+                        next_loader_iter = None
+                        self.logger.info(f"Epoch {epoch}: Prefetched data not available. _train will create loader.")
+
                 self.next_checkpoint_step = self.steps_between_checkpoints
                 self.stats.start_train(epoch)
-                steps = self._train(epoch)
+                steps = self._train(epoch, loader_iter=next_loader_iter, loader_instance=prefetched_loader_instance)
                 self.stats.end_train(epoch, steps)
                 self.logger.debug(f"{utcnow()} Rank {self.my_rank} returned after {steps} steps.")
-                self.framework.get_loader(DatasetType.TRAIN).finalize()
+                self.framework.get_loader(DatasetType.TRAIN, epoch).finalize()
                 # Perform evaluation if enabled
                 if self.do_eval and epoch >= next_eval_epoch:
                     next_eval_epoch += self.epochs_between_evals
                     self.stats.start_eval(epoch)
                     self._eval(epoch)
                     self.stats.end_eval(epoch)
-                    self.framework.get_loader(DatasetType.VALID).finalize()
+                    self.framework.get_loader(DatasetType.VALID, epoch).finalize()
                 self.args.reconfigure(epoch + 1) # reconfigure once per epoch
                 self.stats.end_epoch(epoch)
 
