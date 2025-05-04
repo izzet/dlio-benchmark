@@ -122,7 +122,8 @@ class FormatType(Enum):
     INDEXED_BINARY = 'indexed_binary'
     MMAP_INDEXED_BINARY = 'mmap_indexed_binary'
     SYNTHETIC = 'synthetic'
-    
+    WEBDATASET_NPY = 'webdataset_npy'
+
     def __str__(self):
         return self.value
 
@@ -150,6 +151,8 @@ class FormatType(Enum):
             return FormatType.MMAP_INDEXED_BINARY
         elif FormatType.SYNTHETIC.value == value:
             return FormatType.SYNTHETIC
+        elif FormatType.WEBDATASET_NPY.value == value:
+            return FormatType.WEBDATASET_NPY
 
 class DataLoaderType(Enum):
     """
@@ -162,6 +165,7 @@ class DataLoaderType(Enum):
     CUSTOM='custom'
     NONE='none'
     SYNTHETIC='synthetic'
+    WEBDATASET='webdataset'
     
     def __str__(self):
         return self.value

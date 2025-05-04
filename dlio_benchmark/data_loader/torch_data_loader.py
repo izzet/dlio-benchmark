@@ -19,12 +19,19 @@ import logging
 import math
 import pickle
 import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import (
+    Dataset,
+    DataLoader,
+    IterableDataset,
+    RandomSampler,
+    SequentialSampler,
+)
 from torch.utils.data.sampler import Sampler
 import numpy as np
+import webdataset as wds
 
 from dlio_benchmark.common.constants import MODULE_DATA_LOADER
-from dlio_benchmark.common.enumerations import Shuffle, DatasetType, DataLoaderType
+from dlio_benchmark.common.enumerations import DatasetType, DataLoaderType, FormatType
 from dlio_benchmark.data_loader.base_data_loader import BaseDataLoader
 from dlio_benchmark.reader.reader_factory import ReaderFactory
 from dlio_benchmark.utils.utility import utcnow, DLIOMPI
@@ -85,6 +92,59 @@ class TorchDataset(Dataset):
         return self.reader.read_index(image_idx, step)
 
 
+class WebDataset(wds.WebDataset):
+    @dlp.log_init
+    def __init__(
+        self,
+        urls,
+        handler=wds.reraise_exception,
+        mode=None,
+        resampled=False,
+        repeat=False,
+        shardshuffle=None,
+        cache_size=-1,
+        cache_dir=None,
+        url_to_name=wds.cache.pipe_cleaner,
+        detshuffle=False,
+        nodesplitter=wds.shardlists.single_node_only,
+        workersplitter=wds.shardlists.split_by_worker,
+        select_files=None,
+        rename_files=None,
+        empty_check=True,
+        verbose=False,
+        seed=None,
+    ):
+        super().__init__(
+            urls,
+            handler=handler,
+            mode=mode,
+            resampled=resampled,
+            repeat=repeat,
+            shardshuffle=shardshuffle,
+            cache_size=cache_size,
+            cache_dir=cache_dir,
+            url_to_name=url_to_name,
+            detshuffle=detshuffle,
+            nodesplitter=nodesplitter,
+            workersplitter=workersplitter,
+            select_files=select_files,
+            rename_files=rename_files,
+            empty_check=empty_check,
+            verbose=verbose,
+            seed=seed,
+        )
+
+    @dlp.log
+    def __iter__(self):
+        for sample in dlp.iter(super().__iter__()):
+            yield sample
+        # return super().__iter__()
+
+    @dlp.log
+    def __getitem__(self, index):
+        return super().__getitem__(index)
+
+
 class dlio_sampler(Sampler):
     def __init__(self, rank, size, num_samples, epochs):
         self.size = size
@@ -113,9 +173,29 @@ class TorchDataLoader(BaseDataLoader):
         super().__init__(format_type, dataset_type, epoch_number, DataLoaderType.PYTORCH)
     @dlp.log
     def read(self):
-        dataset = TorchDataset(self.format_type, self.dataset_type, self.epoch_number, self.num_samples,
-                               self._args.read_threads, self.batch_size)
-        sampler = dlio_sampler(self._args.my_rank, self._args.comm_size, self.num_samples, self._args.epochs)
+        if self.format_type == FormatType.WEBDATASET_NPY:
+            dataset = (
+                WebDataset(
+                    "/p/lustre3/izzet/dlio-benchmark-test/unet3d_v100_webdataset_npy_168/data/train/img_{001..168}_of_168.webdataset_npy"
+                )
+                .decode("torchrgb8")
+                .to_tuple("x.npy", "y.npy")
+            )
+        else:
+            dataset = TorchDataset(
+                self.format_type,
+                self.dataset_type,
+                self.epoch_number,
+                self.num_samples,
+                self._args.read_threads,
+                self.batch_size,
+            )
+        sampler = dlio_sampler(
+            self._args.my_rank,
+            self._args.comm_size,
+            self.num_samples,
+            self._args.epochs,
+        )
         if self._args.read_threads >= 1:
             prefetch_factor = math.ceil(self._args.prefetch_size / self._args.read_threads)
         else:
@@ -127,37 +207,43 @@ class TorchDataLoader(BaseDataLoader):
         else:
             prefetch_factor = 2
             if self._args.my_rank == 0:
-                self.logger.debug(
-                    f"{utcnow()} Prefetch size is 0; a default prefetch factor of 2 will be set to Torch DataLoader.")
-        self.logger.debug(f"{utcnow()} Setup dataloader with {self._args.read_threads} workers {torch.__version__}")
-        if self._args.read_threads==0:
-            kwargs={}
+        if self._args.read_threads == 0:
+            kwargs = {}
         else:
-            kwargs={'multiprocessing_context':self._args.multiprocessing_context,
-                    'prefetch_factor': prefetch_factor}
-            if torch.__version__ != '1.3.1':       
-                kwargs['persistent_workers'] = True
-        if torch.__version__ == '1.3.1':
-            if 'prefetch_factor' in kwargs:
-                del kwargs['prefetch_factor']
-            self._dataset = DataLoader(dataset,
-                                       batch_size=self.batch_size,
-                                       sampler=sampler,
-                                       num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
-                                       drop_last=True,
-                                       worker_init_fn=dataset.worker_init, 
-                                       **kwargs)
-        else: 
-            self._dataset = DataLoader(dataset,
-                                       batch_size=self.batch_size,
-                                       sampler=sampler,
-                                       num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
-                                       drop_last=True,
-                                       worker_init_fn=dataset.worker_init,
-                                       **kwargs)  # 2 is the default value
-        self.logger.debug(f"{utcnow()} Rank {self._args.my_rank} will read {len(self._dataset) * self.batch_size} files")
+            kwargs = {
+                "multiprocessing_context": self._args.multiprocessing_context,
+                "prefetch_factor": prefetch_factor,
+            }
+            if torch.__version__ != "1.3.1":
+                kwargs["persistent_workers"] = True
+        if torch.__version__ == "1.3.1":
+            if "prefetch_factor" in kwargs:
+                del kwargs["prefetch_factor"]
+            self._dataset = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                sampler=None if isinstance(dataset, IterableDataset) else sampler,
+                num_workers=self._args.read_threads,
+                pin_memory=self._args.pin_memory,
+                drop_last=True,
+                worker_init_fn=dataset.worker_init
+                if hasattr(dataset, "worker_init")
+                else None,
+                **kwargs,
+            )
+        else:
+            self._dataset = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                sampler=None if isinstance(dataset, IterableDataset) else sampler,
+                num_workers=self._args.read_threads,
+                pin_memory=self._args.pin_memory,
+                drop_last=True,
+                worker_init_fn=dataset.worker_init
+                if hasattr(dataset, "worker_init")
+                else None,
+                **kwargs,
+            )  # 2 is the default value
 
         # self._dataset.sampler.set_epoch(epoch_number)
 

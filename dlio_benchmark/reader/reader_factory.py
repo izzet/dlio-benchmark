@@ -80,6 +80,8 @@ class ReaderFactory(object):
         elif type == FormatType.SYNTHETIC:
             from dlio_benchmark.reader.synthetic_reader import SyntheticReader
             return SyntheticReader(dataset_type, thread_index, epoch_number)
-
+        elif type == FormatType.WEBDATASET_NPY:
+            from dlio_benchmark.reader.webdataset_reader import WebDatasetReader
+            return WebDatasetReader(dataset_type, thread_index, epoch_number)
         else:
             raise Exception("Loading data of %s format is not supported without framework data loader" %type)
