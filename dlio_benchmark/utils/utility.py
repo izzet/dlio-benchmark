@@ -15,22 +15,23 @@
    limitations under the License.
 """
 
-import os
-from datetime import datetime
-import logging
-from time import time, sleep as base_sleep
-from functools import wraps
-import threading
-import json
-from typing import Dict
-import pathlib
-from enum import Enum
-
-import numpy as np
+import argparse
+import importlib.util
 import inspect
+import json
+import logging
+import math
+import numpy as np
+import os
+import pathlib
 import psutil
 import socket
-import importlib.util
+import threading
+from datetime import datetime
+from enum import Enum
+from functools import wraps
+from time import time, sleep as base_sleep
+from typing import Dict
 # UTC timestamp format with microsecond precision
 from dlio_benchmark.common.enumerations import LoggerType, MPIState
 try:
@@ -361,3 +362,103 @@ def sleep(config):
     if sleep_time > 0.0:
         base_sleep(sleep_time)
     return sleep_time
+
+def convert_data_unit(value, original_unit="B", target_unit="B"):
+    """
+    Converts a data size value from one unit to another.
+    
+    Args:
+        value: The numeric value to convert
+        original_unit: The original unit of the value ('B', 'KB', 'MB', 'GB', 'TB', 'PB')
+        target_unit: The target unit to convert to ('B', 'KB', 'MB', 'GB', 'TB', 'PB')
+        
+    Returns:
+        The value converted to the target unit
+    """
+    # Define unit prefixes and their corresponding powers of 1024
+    units = {
+        'B': 0,
+        'KB': 1,
+        'MB': 2,
+        'GB': 3,
+        'TB': 4,
+        'PB': 5
+    }
+    
+    # Validate the input units
+    original_unit = original_unit.upper()
+    target_unit = target_unit.upper()
+    
+    if original_unit not in units:
+        raise ValueError(f"Invalid original unit: {original_unit}. Expected one of {list(units.keys())}")
+    if target_unit not in units:
+        raise ValueError(f"Invalid target unit: {target_unit}. Expected one of {list(units.keys())}")
+    
+    # Convert from original unit to bytes, then from bytes to target unit
+    bytes_value = value * (1024 ** units[original_unit])
+    converted_value = bytes_value / (1024 ** units[target_unit])
+    
+    return converted_value
+
+def format_data_unit(value, original_unit="B"):
+    """
+    Determines the most appropriate unit for a data size value.
+    
+    Args:
+        value: The numeric value to format
+        original_unit: The original unit of the value ('B', 'KB', 'MB', 'GB', 'TB', 'PB')
+        
+    Returns:
+        A tuple containing (converted_value, unit_name) where:
+        - converted_value is the value in the new unit
+        - unit_name is the string name of the new unit
+    """
+    # Define unit prefixes and their corresponding powers of 1024
+    units = {
+        'B': 0,
+        'KB': 1,
+        'MB': 2,
+        'GB': 3,
+        'TB': 4,
+        'PB': 5
+    }
+    
+    # Validate the input unit
+    original_unit = original_unit.upper()
+    if original_unit not in units:
+        raise ValueError(f"Invalid unit: {original_unit}. Expected one of {list(units.keys())}")
+    
+    # Convert to bytes
+    bytes_value = convert_data_unit(value, original_unit, "B")
+    
+    # Find the most appropriate unit
+    power = 0
+    if bytes_value > 0:
+        power = min(5, max(0, int(math.log(bytes_value, 1024))))
+    
+    output_unit = list(units.keys())[power]
+    
+    # Convert from bytes to the appropriate unit
+    converted_value = convert_data_unit(bytes_value, "B", output_unit)
+    
+    return converted_value, output_unit
+
+def format_data_size(value, original_unit="B", decimal_places=4):
+    """
+    Formats a data size value with the most appropriate unit.
+    
+    Args:
+        value: The numeric value to format
+        original_unit: The original unit of the value ('B', 'KB', 'MB', 'GB', 'TB', 'PB')
+        decimal_places: Number of decimal places to show in the formatted output
+        
+    Returns:
+        String with the value in the most appropriate unit
+    """
+    # Get the converted value and appropriate unit
+    converted_value, output_unit = format_data_unit(value, original_unit)
+    
+    # Format the output, always including the specified number of decimal places
+    formatted_value = f"{converted_value:.{decimal_places}f}"
+    
+    return f"{formatted_value} {output_unit}"

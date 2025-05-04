@@ -23,7 +23,7 @@ from abc import ABC, abstractmethod
 from dlio_benchmark.common.enumerations import CheckpointLocationType
 from dlio_benchmark.storage.storage_factory import StorageFactory
 from dlio_benchmark.utils.config import ConfigArguments
-from dlio_benchmark.utils.utility import DLIOMPI, utcnow
+from dlio_benchmark.utils.utility import DLIOMPI, format_data_size, utcnow
 
 
 def get_datatype_size(datatype):
@@ -132,15 +132,18 @@ class BaseCheckpointing(ABC):
                 if self.args.my_rank == 0:
                     self.logger.info(f"{utcnow()} Model state defined")
 
-        model_checkpoint_size = self.comm.allreduce(model_checkpoint_size)/1024./1024./1024.
-        optimizer_checkpoint_size = self.comm.allreduce(optimizer_checkpoint_size)/1024./1024./1024.
+        model_checkpoint_size_bytes = self.comm.allreduce(model_checkpoint_size)
+        optimizer_checkpoint_size_bytes = self.comm.allreduce(optimizer_checkpoint_size)
+        model_checkpoint_size = model_checkpoint_size_bytes/1024./1024./1024.
+        optimizer_checkpoint_size = optimizer_checkpoint_size_bytes/1024./1024./1024.
         if self.args.zero_stage < 3:
             model_checkpoint_size /= self.data_parallelism
+        checkpoint_size_bytes = model_checkpoint_size_bytes + optimizer_checkpoint_size_bytes
         self.checkpoint_size = model_checkpoint_size + optimizer_checkpoint_size
         if self.args.my_rank == 0:
-            self.logger.output(f"{utcnow()} Model size: {model_checkpoint_size:.4f} GB")
-            self.logger.output(f"{utcnow()} Optimizer state size: {optimizer_checkpoint_size:.4f} GB")
-            self.logger.output(f"{utcnow()} Total checkpoint size: {self.checkpoint_size:.4f} GB")
+            self.logger.output(f"{utcnow()} Model size: {format_data_size(model_checkpoint_size_bytes)} ({int(model_checkpoint_size_bytes)} B)")
+            self.logger.output(f"{utcnow()} Optimizer state size: {format_data_size(optimizer_checkpoint_size_bytes)} ({int(optimizer_checkpoint_size_bytes)} B)")
+            self.logger.output(f"{utcnow()} Total checkpoint size: {format_data_size(checkpoint_size_bytes)} ({int(checkpoint_size_bytes)} B)")
 
     @abstractmethod
     def get_tensor(self, length, datatype="int8"):

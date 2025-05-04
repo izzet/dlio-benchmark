@@ -16,7 +16,14 @@
 """
 from numpy import append
 from dlio_benchmark.utils.config import ConfigArguments
-from dlio_benchmark.utils.utility import utcnow, DLIOMPI, DLIOLogger
+from dlio_benchmark.utils.utility import (
+    DLIOMPI, 
+    DLIOLogger, 
+    convert_data_unit, 
+    format_data_unit, 
+    format_data_size, 
+    utcnow,
+)
 
 import os
 import json
@@ -207,19 +214,27 @@ class StatsCounter(object):
                 if self.args.do_train:
                     metric = metric + f"[METRIC] Training Accelerator Utilization [AU] (%): {np.mean(train_au):.4f} ({np.std(train_au):.4f})\n"
                     metric = metric + f"[METRIC] Training Throughput (samples/second): {np.mean(train_throughput):.4f} ({np.std(train_throughput):.4f})\n"
-                    metric = metric + f"[METRIC] Training I/O Throughput (MB/second): {np.mean(train_throughput)*self.record_size/1024/1024:.4f} ({np.std(train_throughput)*self.record_size/1024/1024:.4f})\n"
+                    tiopt_mean, tiopt_unit = format_data_unit(np.mean(train_throughput)*self.record_size)
+                    tiopt_std = convert_data_unit(np.std(train_throughput)*self.record_size, target_unit=tiopt_unit)
+                    metric = metric + f"[METRIC] Training I/O Throughput ({tiopt_unit}/second): {tiopt_mean:.4f} ({tiopt_std:.4f})\n"
                     metric = metric + f"[METRIC] train_au_meet_expectation: {self.summary['metric']['train_au_meet_expectation']}\n"
                 if self.args.do_checkpoint: 
                     metric = metric + f"[METRIC] Checkpoint save duration (seconds): {self.summary['metric']['save_checkpoint_duration_mean_seconds']:.4f} ({self.summary['metric']['save_checkpoint_duration_stdev_seconds']:.4f})\n"
-                    metric = metric + f"[METRIC] Checkpoint save I/O Throughput (GB/second): {self.summary['metric']['save_checkpoint_io_mean_GB_per_second']:.4f} ({self.summary['metric']['save_checkpoint_io_stdev_GB_per_second']:.4f})\n"
+                    sckpt_mean, sckpt_unit = format_data_unit(self.summary['metric']['save_checkpoint_io_mean_GB_per_second'], original_unit='GB')
+                    sckpt_std = convert_data_unit(self.summary['metric']['save_checkpoint_io_stdev_GB_per_second'], target_unit=sckpt_unit)
+                    metric = metric + f"[METRIC] Checkpoint save I/O Throughput ({sckpt_unit}/second): {sckpt_mean:.4f} ({sckpt_std:.4f})\n"
                     if 'load_checkpoint_io_mean_GB_per_second' in self.summary['metric']:
                         metric = metric + f"[METRIC] Checkpoint load duration (seconds): {self.summary['metric']['load_checkpoint_duration_mean_seconds']:.4f} ({self.summary['metric']['load_checkpoint_duration_stdev_seconds']:.4f})\n"
-                        metric = metric + f"[METRIC] Checkpoint load I/O Throughput (GB/second): {self.summary['metric']['load_checkpoint_io_mean_GB_per_second']:.4f} ({self.summary['metric']['load_checkpoint_io_stdev_GB_per_second']:.4f})\n"
+                        lckpt_mean, lckpt_unit = format_data_unit(self.summary['metric']['load_checkpoint_io_mean_GB_per_second'], original_unit='GB')
+                        lckpt_std = convert_data_unit(self.summary['metric']['load_checkpoint_io_stdev_GB_per_second'], target_unit=lckpt_unit)
+                        metric = metric + f"[METRIC] Checkpoint load I/O Throughput ({lckpt_unit}/second): {lckpt_mean:.4f} ({lckpt_std:.4f})\n"
 
                 if self.args.do_eval:
                     metric = metric + f"[METRIC] Eval Accelerator Utilization [AU] (%): {np.mean(eval_au):.4f} ({np.std(eval_au):.4f})\n"
-                    metric = metric + f"[METRIC] Eval Throughput (samples/second): {np.mean(eval_throughput):.6f} ({np.std(eval_throughput):.6f})\n"
-                    metric = metric + f"[METRIC] Eval Throughput (MB/second): {np.mean(eval_throughput)*self.record_size/1024/1024:.6f} ({np.std(eval_throughput)*self.record_size/1024/1024:.6f})\n"
+                    metric = metric + f"[METRIC] Eval Throughput (samples/second): {np.mean(eval_throughput):.4f} ({np.std(eval_throughput):.4f})\n"
+                    eiopt_mean, eiopt_unit = format_data_unit(np.mean(eval_throughput)*self.record_size)
+                    eiopt_std = convert_data_unit(np.std(eval_throughput)*self.record_size, target_unit=eiopt_unit)
+                    metric = metric + f"[METRIC] Eval Throughput ({eiopt_unit}/second): {eiopt_mean:.4f} ({eiopt_std:.4f})\n"
                     metric = metric + f"[METRIC] eval_au_meet_expectation: {self.summary['metric']['eval_au_meet_expectation']}\n"
                 metric+="[METRIC] ==========================================================\n"
                 self.logger.output(metric)   
@@ -349,7 +364,9 @@ class StatsCounter(object):
         self.per_epoch_stats[epoch][f'save_ckpt{block}']['duration'] = float(duration.total_seconds())
         self.per_epoch_stats[epoch][f'save_ckpt{block}']['throughput'] = self.checkpoint_size / float(duration.total_seconds())
         if self.my_rank == 0:
-            self.logger.output(f"{ts} Finished saving checkpoint {block} for epoch {epoch} in {duration.total_seconds():.4f} s; Throughput: {self.per_epoch_stats[epoch][f'save_ckpt{block}']['throughput']:.4f} GB/s")
+            ckpt = self.per_epoch_stats[epoch][f'save_ckpt{block}']['throughput']
+            ckpt_fmt = f"Throughput: {format_data_size(ckpt, original_unit='GB')}/s"
+            self.logger.output(f"{ts} Finished saving checkpoint {block} for epoch {epoch} in {duration.total_seconds():.4f} s ({ckpt_fmt})")
 
     def start_load_ckpt(self, epoch, block, steps_taken):
         ts = utcnow()
@@ -366,7 +383,9 @@ class StatsCounter(object):
         self.per_epoch_stats[epoch][f'load_ckpt{block}']['duration'] = float(duration.total_seconds())
         self.per_epoch_stats[epoch][f'load_ckpt{block}']['throughput'] = self.checkpoint_size / float(duration.total_seconds())
         if self.my_rank == 0:
-            self.logger.output(f"{ts} Finished loading checkpoint {block} for epoch {epoch} in {duration.total_seconds():.4f} s; Throughput: {self.per_epoch_stats[epoch][f'load_ckpt{block}']['throughput']:.4f} GB/s")
+            ckpt = self.per_epoch_stats[epoch][f'load_ckpt{block}']['throughput']
+            ckpt_fmt = f"Throughput: {format_data_size(ckpt, original_unit='GB')}/s"
+            self.logger.output(f"{ts} Finished loading checkpoint {block} for epoch {epoch} in {duration.total_seconds():.4f} s ({ckpt_fmt})")
 
     def start_loading(self):
         self.start_time_loading = time()
