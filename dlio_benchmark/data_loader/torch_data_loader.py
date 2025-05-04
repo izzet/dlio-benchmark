@@ -20,7 +20,7 @@ import logging
 import math
 import pickle
 import torch
-from torch.utils.data import Dataset, DataLoader, RandomSampler, SequentialSampler
+from torch.utils.data import Dataset, DataLoader, IterableDataset, RandomSampler, SequentialSampler
 from torch.utils.data.sampler import Sampler
 import numpy as np
 
