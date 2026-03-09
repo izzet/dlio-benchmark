@@ -16,6 +16,7 @@
 """
 
 from dlio_benchmark.common.enumerations import FrameworkType, DatasetType, DataLoaderType
+from dlio_benchmark.data_loader.data_loader_factory import DataLoaderFactory
 from dlio_benchmark.framework.framework import Framework, DummyTraceObject
 from dlio_benchmark.common.constants import MODULE_AI_FRAMEWORK
 import torch
@@ -86,11 +87,11 @@ class TorchFramework(Framework):
         return self.model(batch, computation_time)
 
     @dlp.log
-    def get_loader(self, dataset_type=DatasetType.TRAIN):
-        if dataset_type == DatasetType.TRAIN:
-            return self.reader_train
-        else:
-            return self.reader_valid
+    def get_loader(self, dataset_type=DatasetType.TRAIN, epoch=1):
+        return DataLoaderFactory.get_loader(
+            self.data_loader_type, self.format_type,
+            dataset_type=dataset_type, epoch=epoch,
+        )
 
     @dlp.log
     def is_nativeio_available(self):

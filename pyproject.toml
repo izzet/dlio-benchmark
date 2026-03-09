@@ -2,6 +2,10 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "dlio-benchmark"
+dynamic = ["version", "dependencies", "optional-dependencies", "scripts", "readme", "description", "classifiers", "keywords", "urls"]
+
 [tool.pytest]
 timeout = 3000
 log_cli = true

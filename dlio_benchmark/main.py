@@ -42,6 +42,12 @@ from dlio_benchmark.framework.framework_factory import FrameworkFactory
 from dlio_benchmark.data_generator.generator_factory import GeneratorFactory
 from dlio_benchmark.storage.storage_factory import StorageFactory
 
+try:
+    from dfoptimizer.runtime import tunable, knob, optimizer_context
+    _HAS_DFOPTIMIZER = True
+except ImportError:
+    _HAS_DFOPTIMIZER = False
+
 dlp = Profile(MODULE_DLIO_BENCHMARK)
 # To make sure the output folder is the same in all the nodes. We have to do this.
 
@@ -226,7 +232,8 @@ class DLIOBenchmark(object):
         self.stats.checkpoint_size = 0
         if (not self.generate_only) and (self.do_checkpoint):
             self.checkpointing_mechanism = CheckpointingFactory().get_mechanism(self.args.checkpoint_mechanism)
-            self.stats.checkpoint_size = self.checkpointing_mechanism.checkpoint_size    
+            self.stats.checkpoint_size = self.checkpointing_mechanism.checkpoint_size
+        self._optimizer_started = False
         self.comm.barrier()
 
     @dft_ai.pipeline.evaluate
@@ -236,7 +243,7 @@ class DLIOBenchmark(object):
         """
         step = 1
         total = math.floor(self.num_samples * self.num_files_eval / self.batch_size_eval / self.comm_size)
-        loader = self.framework.get_loader(DatasetType.VALID)
+        loader = self.eval_loader
         self.stats.start_loading()
         for batch in loader.next():
             # @ray: fixing uneven data fetch and computation count (same issue with `_train` below)
@@ -275,16 +282,17 @@ class DLIOBenchmark(object):
         block = 1  # A continuous period of training steps, ended by checkpointing
         block_step = overall_step = 1  # Steps are taken within blocks
         epoch = 1
-        for i in range(self.args.num_checkpoints_write):
-            #self.stats.start_block(epoch, block)
-            # We still make sure that the checkpoint is done after allreduce; therefore, allreduce here is required. 
+        for i in dft_ai.checkpoint.iter(range(self.args.num_checkpoints_write), include_iter=False):
+            dft_ai.checkpoint.start(metadata=True)
+            # We still make sure that the checkpoint is done after allreduce; therefore, allreduce here is required.
             self.framework.compute(None, epoch, block_step, self.args.time_between_checkpoints)
             self.comm.barrier()
             self.stats.start_save_ckpt(epoch, block, overall_step)
             self.checkpointing_mechanism.save_checkpoint(epoch, overall_step)
-            if self.args.checkpoint_rank_sync: 
+            if self.args.checkpoint_rank_sync:
                 self.comm.barrier()
             self.stats.end_save_ckpt(epoch, block)
+            dft_ai.checkpoint.stop(metadata=True)
             block = block+1
             overall_step = overall_step + 1
         if self.comm.rank == 0:
@@ -297,21 +305,67 @@ class DLIOBenchmark(object):
         block = 1  # A continuous period of training steps, ended by checkpointing
         block_step = overall_step = 1  # Steps are taken within blocks
         epoch = 1
-        for i in range(self.args.num_checkpoints_read):
+        for i in dft_ai.checkpoint.iter(range(self.args.num_checkpoints_read), include_iter=False):
+            dft_ai.checkpoint.start(metadata=True)
             self.framework.compute(None, epoch, block_step, self.args.time_between_checkpoints)
             self.comm.barrier()
             self.stats.start_load_ckpt(epoch, block, overall_step)
             self.checkpointing_mechanism.load_checkpoint(epoch, overall_step)
-            if self.args.checkpoint_rank_sync: 
+            if self.args.checkpoint_rank_sync:
                 self.comm.barrier()
             self.stats.end_load_ckpt(epoch, block)
+            dft_ai.checkpoint.stop(metadata=True)
             block = block+1
             overall_step = overall_step + 1
         if self.comm.rank == 0:
             self.logger.output(f"{utcnow()} Checkpointing write started")
 
+    def make_loader(self, epoch, prefetch_size=None, read_threads=None):
+        """Create a fresh training DataLoader for the given epoch.
+
+        Applies optimizer overrides to ConfigArguments before constructing
+        the loader so that knob adjustments take effect. Rank 0 receives
+        overrides from the @tunable decorator; values are then broadcast
+        to all ranks so every process uses the same knob settings.
+        """
+        if prefetch_size is None:
+            prefetch_size = self.args.prefetch_size
+        if read_threads is None:
+            read_threads = self.args.read_threads
+
+        # Broadcast knob values from rank 0 to ensure consistency
+        knobs = [prefetch_size, read_threads]
+        knobs = self.comm.bcast(knobs, root=0)
+        prefetch_size, read_threads = knobs
+
+        self.args.prefetch_size = prefetch_size
+        self.args.read_threads = read_threads
+        if self.my_rank == 0:
+            self.logger.output(f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size} threads={read_threads}")
+        loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN, epoch=epoch)
+        loader.read()
+
+        # Lazily start optimizer context after first loader creation (rank 0 only)
+        if (
+            not self._optimizer_started
+            and _HAS_DFOPTIMIZER
+            and os.environ.get("DFOPTIMIZER_ENABLE", "0") == "1"
+            and self.my_rank == 0
+        ):
+            group_file = os.environ.get("DFTRACER_MOFKA_GROUP_FILE", "")
+            self._optimizer_ctx = optimizer_context(
+                namespace="dlio",
+                group_file=group_file,
+                topic_plans="optimizer_plans",
+                topic_acks="optimizer_acks",
+                topic_registry="optimizer_registry",
+            )
+            self._optimizer_started = True
+
+        return loader
+
     @dft_ai.pipeline.train
-    def _train(self, epoch):
+    def _train(self, epoch, loader):
         """
         Training loop for reading the dataset and performing training computations.
         :return: returns total steps.
@@ -322,7 +376,6 @@ class DLIOBenchmark(object):
         self.steps_per_epoch = max_steps
         # Start the very first block
         self.stats.start_block(epoch, block)
-        loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN)
         self.stats.start_loading()
         for batch in loader.next():
             # @ray: fixing uneven data fetch and computation count
@@ -397,30 +450,40 @@ class DLIOBenchmark(object):
             next_eval_epoch = self.eval_after_epoch
             self.next_checkpoint_epoch = self.checkpoint_after_epoch
             epoch = 1
-            # Initialize the dataset
+            # Initialize the dataset (stores format/loader type, creates storage)
             self.args.reconfigure(epoch)
             self.framework.init_loader(self.args.format, epoch=epoch, data_loader=self.args.data_loader)
-            self.framework.get_loader(dataset_type=DatasetType.TRAIN).read()
+            # Prepare eval loader once (not tunable)
             if self.do_eval:
-                self.framework.get_loader(dataset_type=DatasetType.VALID).read()
+                self.eval_loader = self.framework.get_loader(dataset_type=DatasetType.VALID, epoch=epoch)
+                self.eval_loader.read()
             self.comm.barrier()
             for epoch in dft_ai.pipeline.epoch.iter(range(1, self.epochs + 1), include_iter=False):
+                dft_ai.pipeline.epoch.start(metadata=True)
                 self.stats.start_epoch(epoch)
                 self.next_checkpoint_step = self.steps_between_checkpoints
+                # Create fresh train loader each epoch (subject to @tunable overrides)
+                loader = self.make_loader(
+                    epoch=epoch,
+                    prefetch_size=self.args.prefetch_size,
+                    read_threads=self.args.read_threads,
+                )
                 self.stats.start_train(epoch)
-                steps = self._train(epoch)
+                steps = self._train(epoch, loader)
                 self.stats.end_train(epoch, steps)
                 self.logger.debug(f"{utcnow()} Rank {self.my_rank} returned after {steps} steps.")
-                self.framework.get_loader(DatasetType.TRAIN).finalize()
+                loader.finalize()
                 # Perform evaluation if enabled
                 if self.do_eval and epoch >= next_eval_epoch:
                     next_eval_epoch += self.epochs_between_evals
                     self.stats.start_eval(epoch)
                     self._eval(epoch)
                     self.stats.end_eval(epoch)
-                    self.framework.get_loader(DatasetType.VALID).finalize()
                 self.args.reconfigure(epoch + 1) # reconfigure once per epoch
                 self.stats.end_epoch(epoch)
+                dft_ai.pipeline.epoch.stop(metadata=True)
+            if self.do_eval:
+                self.eval_loader.finalize()
 
         if (self.args.checkpoint_only):
             self._checkpoint()            
@@ -458,6 +521,23 @@ class DLIOBenchmark(object):
         self.comm.barrier()
         if dftracer_finalize and dftracer:
             self.args.finalize_dftracer(dftracer)
+
+# Apply @tunable decorator to make_loader if dfoptimizer is available.
+if _HAS_DFOPTIMIZER:
+    DLIOBenchmark.make_loader = tunable(knobs={
+        "prefetch_size": knob(
+            default=2, range=(1, 32), type=int,
+            responds_to={
+                "dataloader_prefetch": {"direction": "increase", "step": 2, "min_persistence": 1},
+            },
+        ),
+        "read_threads": knob(
+            default=0, range=(0, 4), type=int,
+            responds_to={
+                "reader_parallelism": {"direction": "increase", "step": 1, "min_persistence": 1},
+            },
+        ),
+    })(DLIOBenchmark.make_loader)
 
 
 @hydra.main(version_base=None, config_path="configs", config_name="config")
