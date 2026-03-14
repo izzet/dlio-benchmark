@@ -233,8 +233,46 @@ class DLIOBenchmark(object):
         if (not self.generate_only) and (self.do_checkpoint):
             self.checkpointing_mechanism = CheckpointingFactory().get_mechanism(self.args.checkpoint_mechanism)
             self.stats.checkpoint_size = self.checkpointing_mechanism.checkpoint_size
+        self._optimizer_ctx = None
         self._optimizer_started = False
+        self._cached_loader = None
+        self._cached_prefetch = None
+        self._cached_read_threads = None
+        self._ensure_optimizer_runtime_started()
         self.comm.barrier()
+
+    def _ensure_optimizer_runtime_started(self):
+        if (
+            self._optimizer_started
+            or not _HAS_DFOPTIMIZER
+            or os.environ.get("DFOPTIMIZER_ENABLE", "0") != "1"
+            or self.my_rank != 0
+        ):
+            return
+
+        group_file = os.environ.get("DFTRACER_MOFKA_GROUP_FILE", "")
+        self._optimizer_ctx = optimizer_context(
+            namespace="dlio",
+            group_file=group_file,
+            topic_plans="optimizer_plans",
+            topic_acks="optimizer_acks",
+            topic_registry="optimizer_registry",
+        )
+        self._optimizer_started = True
+
+        try:
+            tunable_func = getattr(self.make_loader, "__func__", self.make_loader)
+            register = getattr(tunable_func, "_tunable_register", None)
+            if callable(register):
+                register(
+                    self._optimizer_ctx,
+                    current_values={
+                        "prefetch_size": self.args.prefetch_size,
+                        "read_threads": self.args.read_threads,
+                    },
+                )
+        except Exception as ex:
+            self.logger.warning(f"{utcnow()} Failed to pre-register optimizer knobs: {ex}")
 
     @dft_ai.pipeline.evaluate
     def _eval(self, epoch):
@@ -321,12 +359,15 @@ class DLIOBenchmark(object):
             self.logger.output(f"{utcnow()} Checkpointing write started")
 
     def make_loader(self, epoch, prefetch_size=None, read_threads=None):
-        """Create a fresh training DataLoader for the given epoch.
+        """Create or reuse a training DataLoader for the given epoch.
 
-        Applies optimizer overrides to ConfigArguments before constructing
-        the loader so that knob adjustments take effect. Rank 0 receives
-        overrides from the @tunable decorator; values are then broadcast
-        to all ranks so every process uses the same knob settings.
+        When prefetch_size and read_threads are unchanged from the previous
+        epoch, the cached DataLoader (with its persistent workers) is reused
+        to avoid per-epoch fork/init overhead.  A new DataLoader is created
+        only when knob values actually change.
+
+        Rank 0 receives overrides from the @tunable decorator; values are
+        then broadcast to all ranks so every process uses the same settings.
         """
         if prefetch_size is None:
             prefetch_size = self.args.prefetch_size
@@ -340,27 +381,32 @@ class DLIOBenchmark(object):
 
         self.args.prefetch_size = prefetch_size
         self.args.read_threads = read_threads
-        if self.my_rank == 0:
-            self.logger.output(f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size} threads={read_threads}")
-        loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN, epoch=epoch)
-        loader.read()
 
-        # Lazily start optimizer context after first loader creation (rank 0 only)
+        # Reuse cached loader if knobs haven't changed
         if (
-            not self._optimizer_started
-            and _HAS_DFOPTIMIZER
-            and os.environ.get("DFOPTIMIZER_ENABLE", "0") == "1"
-            and self.my_rank == 0
+            self._cached_loader is not None
+            and self._cached_prefetch == prefetch_size
+            and self._cached_read_threads == read_threads
         ):
-            group_file = os.environ.get("DFTRACER_MOFKA_GROUP_FILE", "")
-            self._optimizer_ctx = optimizer_context(
-                namespace="dlio",
-                group_file=group_file,
-                topic_plans="optimizer_plans",
-                topic_acks="optimizer_acks",
-                topic_registry="optimizer_registry",
-            )
-            self._optimizer_started = True
+            if self.my_rank == 0:
+                self.logger.output(
+                    f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size}"
+                    f" threads={read_threads} (cached)"
+                )
+            loader = self._cached_loader
+        else:
+            if self.my_rank == 0:
+                self.logger.output(
+                    f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size}"
+                    f" threads={read_threads} (new)"
+                )
+            loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN, epoch=epoch)
+            loader.read()
+            self._cached_loader = loader
+            self._cached_prefetch = prefetch_size
+            self._cached_read_threads = read_threads
+
+        self._ensure_optimizer_runtime_started()
 
         return loader
 
@@ -518,6 +564,15 @@ class DLIOBenchmark(object):
             # Save collected stats to disk
             self.stats.finalize()
             self.stats.save_data()
+        if self.my_rank == 0 and self._optimizer_ctx is not None:
+            try:
+                self.logger.info(f"{utcnow()} Stopping optimizer runtime context")
+                self._optimizer_ctx.stop()
+            except Exception as ex:
+                self.logger.warning(f"{utcnow()} Failed to stop optimizer runtime context: {ex}")
+            finally:
+                self._optimizer_ctx = None
+                self._optimizer_started = False
         self.comm.barrier()
         if dftracer_finalize and dftracer:
             self.args.finalize_dftracer(dftracer)
@@ -526,15 +581,25 @@ class DLIOBenchmark(object):
 if _HAS_DFOPTIMIZER:
     DLIOBenchmark.make_loader = tunable(knobs={
         "prefetch_size": knob(
-            default=2, range=(1, 32), type=int,
+            default=2, range=(1, 16), type=int,
             responds_to={
-                "dataloader_prefetch": {"direction": "increase", "step": 2, "min_persistence": 1},
+                "dataloader_prefetch": {
+                    "direction": "increase",
+                    "step": 2,
+                    "min_persistence": 2,
+                    "cooldown_windows": 4,
+                },
             },
         ),
         "read_threads": knob(
             default=0, range=(0, 4), type=int,
             responds_to={
-                "reader_parallelism": {"direction": "increase", "step": 1, "min_persistence": 1},
+                "reader_parallelism": {
+                    "direction": "increase",
+                    "step": 1,
+                    "min_persistence": 2,
+                    "cooldown_windows": 4,
+                },
             },
         ),
     })(DLIOBenchmark.make_loader)
