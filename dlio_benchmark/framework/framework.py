@@ -51,6 +51,10 @@ class Framework(ABC):
     def init_loader(self, format_type, epoch, data_loader=None):
         self.format_type = format_type
         self.data_loader_type = data_loader
+        self.reader_train = DataLoaderFactory.get_loader(data_loader, format_type,
+                                                         dataset_type=DatasetType.TRAIN, epoch=epoch)
+        self.reader_valid = DataLoaderFactory.get_loader(data_loader, format_type,
+                                                         dataset_type=DatasetType.VALID, epoch=epoch)
         self.storage = StorageFactory().get_storage(self.args.storage_type, self.args.storage_root, self.args.framework)
 
     @abstractmethod 

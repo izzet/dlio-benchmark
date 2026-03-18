@@ -77,7 +77,11 @@ class TFReader(FormatReader):
         return self._resized_image
 
     @dlp.log
-    def next(self):
+    def next(self, read_threads=None, prefetch_size=None):
+        if read_threads is None:
+            read_threads = self._args.read_threads
+        if prefetch_size is None:
+            prefetch_size = self._args.prefetch_size
         self.logger.debug(f"{utcnow()} Reading {len(self._file_list)} files thread {self.thread_index} rank {self._args.my_rank}")
 
         # @ray: solution to prevent error when tf.data.Dataset cannot find files provided within self._file_list
@@ -89,25 +93,25 @@ class TFReader(FormatReader):
             return []
 
         filenames = tf.data.Dataset.list_files(self._file_list, shuffle=False)
-        # sharding in the file list if we have enought files. 
+        # sharding in the file list if we have enought files.
         if (len(self._file_list) >= self._args.comm_size):
             filenames = filenames.shard(num_shards=self._args.comm_size, index=self._args.my_rank)
             self.logger.debug(f"{utcnow()} shard {filenames} files index {self._args.my_rank} number {self._args.comm_size}")
-        
+
         self._dataset = tf.data.TFRecordDataset(filenames=filenames, buffer_size=self._args.transfer_size,
-                                                num_parallel_reads=self._args.read_threads)
-				  
+                                                num_parallel_reads=read_threads)
+
         if self._args.sample_shuffle != Shuffle.OFF:
             if self._args.sample_shuffle == Shuffle.SEED:
                 self._dataset = self._dataset.shuffle(buffer_size=self._args.shuffle_size,
                                           seed=self._args.seed)
             else:
                 self._dataset = self._dataset.shuffle(buffer_size=self._args.shuffle_size)
-		
+
         # shard the dataset if it is not done already.
         if (len(self._file_list) < self._args.comm_size):
             self._dataset =  self._dataset.shard(num_shards=self._args.comm_size, index=self._args.my_rank)
-	
+
         self._dataset = self._dataset.batch(self.batch_size, drop_remainder=True)
         self._dataset = self._dataset.map(
                 lambda x: tf.py_function(func=self._parse_image, inp=[x], Tout=[tf.uint8]),
@@ -115,8 +119,8 @@ class TFReader(FormatReader):
 
         self._dataset = self._dataset.repeat()
         total = math.floor(len(self._file_list)/self._args.comm_size / self.batch_size * self._args.num_samples_per_file)
-        
-        return self._dataset.take(total*self._args.epochs).prefetch(buffer_size=self._args.prefetch_size)
+
+        return self._dataset.take(total*self._args.epochs).prefetch(buffer_size=prefetch_size)
     
     @dlp.log
     def read_index(self, image_idx, step):

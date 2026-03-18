@@ -109,30 +109,36 @@ class TorchDataLoader(BaseDataLoader):
         super().__init__(format_type, dataset_type, epoch_number, DataLoaderType.PYTORCH)
 
     @dlp.log
-    def read(self):
+    def read(self, read_threads=None, prefetch_size=None):
+        # Use explicit args if provided (avoids ConfigArguments singleton
+        # being reset by TorchDataset pickling during DataLoader creation).
+        if read_threads is None:
+            read_threads = self._args.read_threads
+        if prefetch_size is None:
+            prefetch_size = self._args.prefetch_size
         dataset = TorchDataset(self.format_type, self.dataset_type, self.epoch_number, self.num_samples,
-                               self._args.read_threads, self.batch_size)
+                               read_threads, self.batch_size)
         sampler = dlio_sampler(self._args.my_rank, self._args.comm_size, self.num_samples, self._args.epochs)
-        if self._args.read_threads >= 1:
-            prefetch_factor = math.ceil(self._args.prefetch_size / self._args.read_threads)
+        if read_threads >= 1:
+            prefetch_factor = math.ceil(prefetch_size / read_threads)
         else:
-            prefetch_factor = self._args.prefetch_size
+            prefetch_factor = prefetch_size
         if prefetch_factor > 0:
             if self._args.my_rank == 0:
                 self.logger.debug(
-                    f"{utcnow()} Prefetch size is {self._args.prefetch_size}; prefetch factor of {prefetch_factor} will be set to Torch DataLoader.")
+                    f"{utcnow()} Prefetch size is {prefetch_size}; prefetch factor of {prefetch_factor} will be set to Torch DataLoader.")
         else:
             prefetch_factor = 2
             if self._args.my_rank == 0:
                 self.logger.debug(
                     f"{utcnow()} Prefetch size is 0; a default prefetch factor of 2 will be set to Torch DataLoader.")
-        self.logger.debug(f"{utcnow()} Setup dataloader with {self._args.read_threads} workers {torch.__version__}")
-        if self._args.read_threads==0:
+        self.logger.debug(f"{utcnow()} Setup dataloader with {read_threads} workers {torch.__version__}")
+        if read_threads==0:
             kwargs={}
         else:
             kwargs={'multiprocessing_context':self._args.multiprocessing_context,
                     'prefetch_factor': prefetch_factor}
-            if torch.__version__ != '1.3.1':       
+            if torch.__version__ != '1.3.1':
                 kwargs['persistent_workers'] = True
         if torch.__version__ == '1.3.1':
             if 'prefetch_factor' in kwargs:
@@ -140,20 +146,25 @@ class TorchDataLoader(BaseDataLoader):
             self._dataset = DataLoader(dataset,
                                        batch_size=self.batch_size,
                                        sampler=sampler,
-                                       num_workers=self._args.read_threads,
-                                       pin_memory=self._args.pin_memory,
-                                       drop_last=True,
-                                       worker_init_fn=dataset.worker_init, 
-                                       **kwargs)
-        else: 
-            self._dataset = DataLoader(dataset,
-                                       batch_size=self.batch_size,
-                                       sampler=sampler,
-                                       num_workers=self._args.read_threads,
+                                       num_workers=read_threads,
                                        pin_memory=self._args.pin_memory,
                                        drop_last=True,
                                        worker_init_fn=dataset.worker_init,
-                                       **kwargs)  # 2 is the default value
+                                       **kwargs)
+        else:
+            self._dataset = DataLoader(dataset,
+                                       batch_size=self.batch_size,
+                                       sampler=sampler,
+                                       num_workers=read_threads,
+                                       pin_memory=self._args.pin_memory,
+                                       drop_last=True,
+                                       worker_init_fn=dataset.worker_init,
+                                       **kwargs)
+        if self._args.my_rank == 0:
+            self.logger.output(
+                f"{utcnow()} TorchDataLoader.read: num_workers={self._dataset.num_workers}"
+                f" persistent_workers={getattr(self._dataset, 'persistent_workers', '?')}"
+                f" read_threads={read_threads} prefetch_size={prefetch_size}")
         self.logger.debug(f"{utcnow()} Rank {self._args.my_rank} will read {len(self._dataset) * self.batch_size} files")
 
         # self._dataset.sampler.set_epoch(epoch_number)

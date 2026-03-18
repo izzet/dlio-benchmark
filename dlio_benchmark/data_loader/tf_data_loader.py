@@ -61,8 +61,11 @@ class TFDataLoader(BaseDataLoader):
         self._dataset = None
 
     @dlp.log
-    def read(self):
-        read_threads = self._args.read_threads
+    def read(self, read_threads=None, prefetch_size=None):
+        if read_threads is None:
+            read_threads = self._args.read_threads
+        if prefetch_size is None:
+            prefetch_size = self._args.prefetch_size
         if read_threads == 0:
             if self._args.my_rank == 0:
                 self.logger.warning(
@@ -85,13 +88,15 @@ class TFDataLoader(BaseDataLoader):
                                                                                 self._args.max_dimension), x),
                                                                                 cycle_length=read_threads,
                                                                                 num_parallel_calls=read_threads)
-            if self._args.prefetch_size > 0:
-                self._dataset = self._dataset.prefetch(buffer_size=self._args.prefetch_size)
+            if prefetch_size > 0:
+                self._dataset = self._dataset.prefetch(buffer_size=prefetch_size)
         else:
             self._dataset = ReaderFactory.get_reader(type=self.format_type,
                                           dataset_type=self.dataset_type,
                                           thread_index=-1,
-                                          epoch_number=self.epoch_number).next()
+                                          epoch_number=self.epoch_number).next(
+                                              read_threads=read_threads,
+                                              prefetch_size=prefetch_size)
 
     @dlp.log
     def next(self):

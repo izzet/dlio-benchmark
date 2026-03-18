@@ -82,7 +82,7 @@ class TFFramework(Framework):
         # tf.function(self.model)(epoch_number, step, computation_time)
 
     @dlp.log
-    def get_loader(self, dataset_type=DatasetType.TRAIN):
+    def get_loader(self, dataset_type=DatasetType.TRAIN, epoch=1):
         if dataset_type == DatasetType.TRAIN:
             return self.reader_train
         else:

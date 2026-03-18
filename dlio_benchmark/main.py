@@ -401,7 +401,7 @@ class DLIOBenchmark(object):
                     f" threads={read_threads} (new)"
                 )
             loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN, epoch=epoch)
-            loader.read()
+            loader.read(read_threads=read_threads, prefetch_size=prefetch_size)
             self._cached_loader = loader
             self._cached_prefetch = prefetch_size
             self._cached_read_threads = read_threads
@@ -423,37 +423,59 @@ class DLIOBenchmark(object):
         # Start the very first block
         self.stats.start_block(epoch, block)
         self.stats.start_loading()
-        for batch in loader.next():
-            # @ray: fixing uneven data fetch and computation count
+        batch_iter = loader.next()
+        while True:
+            dft_ai.update(epoch=epoch, step=overall_step, args={"max_steps": max_steps})
+            # pipeline.step wraps the full fetch+compute+sync cycle so the
+            # analyzer control window captures both data-loading and compute
+            # time in a single step-level view.
+            # Data event first, then control boundary — the control boundary
+            # triggers the analyzer drain, so the data event must already be
+            # queued in the Mofka producer before the boundary arrives.
+            dft_ai.pipeline.step.start(metadata=True)
+            dft_ai.pipeline.step.start()
+            try:
+                batch = next(batch_iter)
+            except StopIteration:
+                dft_ai.pipeline.step.stop()
+                dft_ai.pipeline.step.stop(metadata=True)
+                break
             # Check if max steps reached to prevent incomplete fetch/compute pairs
-            # This ensures accurate event counting by stopping compute when step limit is hit
             if overall_step > max_steps or ((self.total_training_steps > 0) and (overall_step > self.total_training_steps)):
                 if self.args.my_rank == 0:
                     self.logger.info(f"{utcnow()} Maximum number of steps reached")
                 if (block_step != 1 and self.do_checkpoint) or (not self.do_checkpoint):
                     self.stats.end_block(epoch, block, block_step - 1)
+                dft_ai.pipeline.step.stop()
+                dft_ai.pipeline.step.stop(metadata=True)
                 break
             self.stats.batch_loaded(epoch, overall_step, block)
-            computation_time = self.args.computation_time
-            if (isinstance(computation_time, dict) and len(computation_time) > 0) or (isinstance(computation_time, float) and  computation_time > 0):
-                self.framework.trace_object("Train", overall_step, 1)
-            self.stats.start_compute()
-            self.framework.compute(batch, epoch, block_step, self.computation_time)
-            self.stats.batch_processed(epoch, overall_step, block)
-            # This is the barrier to simulate allreduce. It is required to simulate the actual workloads.
-            self.comm.barrier()
-            if self.do_checkpoint and (
-                    self.steps_between_checkpoints >= 0) and overall_step == self.next_checkpoint_step:
-                self.stats.end_block(epoch, block, block_step)
-                self.stats.start_save_ckpt(epoch, block, overall_step)
-                self.checkpointing_mechanism.save_checkpoint(epoch, overall_step)
-                self.stats.end_save_ckpt(epoch, block)
-                block += 1
-                # Reset the number of steps after every checkpoint to mark the start of a new block
-                block_step = 1
-                self.next_checkpoint_step += self.steps_between_checkpoints
-            else:
-                block_step += 1
+            dft_ai.compute.step.start(metadata=True)
+            try:
+                computation_time = self.args.computation_time
+                if (isinstance(computation_time, dict) and len(computation_time) > 0) or (isinstance(computation_time, float) and  computation_time > 0):
+                    self.framework.trace_object("Train", overall_step, 1)
+                self.stats.start_compute()
+                self.framework.compute(batch, epoch, block_step, self.computation_time)
+                self.stats.batch_processed(epoch, overall_step, block)
+                # This is the barrier to simulate allreduce. It is required to simulate the actual workloads.
+                self.comm.barrier()
+                if self.do_checkpoint and (
+                        self.steps_between_checkpoints >= 0) and overall_step == self.next_checkpoint_step:
+                    self.stats.end_block(epoch, block, block_step)
+                    self.stats.start_save_ckpt(epoch, block, overall_step)
+                    self.checkpointing_mechanism.save_checkpoint(epoch, overall_step)
+                    self.stats.end_save_ckpt(epoch, block)
+                    block += 1
+                    # Reset the number of steps after every checkpoint to mark the start of a new block
+                    block_step = 1
+                    self.next_checkpoint_step += self.steps_between_checkpoints
+                else:
+                    block_step += 1
+            finally:
+                dft_ai.compute.step.stop(metadata=True)
+            dft_ai.pipeline.step.stop()
+            dft_ai.pipeline.step.stop(metadata=True)
             overall_step += 1
             # start a new block here
             if block_step == 1 and block != 1:
@@ -592,7 +614,7 @@ if _HAS_DFOPTIMIZER:
             },
         ),
         "read_threads": knob(
-            default=0, range=(0, 4), type=int,
+            default=0, range=(0, 16), type=int,
             responds_to={
                 "reader_parallelism": {
                     "direction": "increase",
