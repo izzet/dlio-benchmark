@@ -43,7 +43,7 @@ from dlio_benchmark.data_generator.generator_factory import GeneratorFactory
 from dlio_benchmark.storage.storage_factory import StorageFactory
 
 try:
-    from dfoptimizer.runtime import tunable, knob, optimizer_context
+    from dfoptimizer.runtime import tunable, knob, optimizer_context, Window
     _HAS_DFOPTIMIZER = True
 except ImportError:
     _HAS_DFOPTIMIZER = False
@@ -426,19 +426,17 @@ class DLIOBenchmark(object):
         batch_iter = loader.next()
         while True:
             dft_ai.update(epoch=epoch, step=overall_step, args={"max_steps": max_steps})
-            # pipeline.step wraps the full fetch+compute+sync cycle so the
-            # analyzer control window captures both data-loading and compute
-            # time in a single step-level view.
-            # Data event first, then control boundary — the control boundary
-            # triggers the analyzer drain, so the data event must already be
-            # queued in the Mofka producer before the boundary arrives.
+            # Window boundary (gated by every_n) — replaces pipeline.step
+            # control events. Only emits to Mofka at cadence boundaries.
+            if self._window is not None:
+                self._window.start()
             dft_ai.pipeline.step.start(metadata=True)
-            dft_ai.pipeline.step.start()
             try:
                 batch = next(batch_iter)
             except StopIteration:
-                dft_ai.pipeline.step.stop()
                 dft_ai.pipeline.step.stop(metadata=True)
+                if self._window is not None:
+                    self._window.stop()
                 break
             # Check if max steps reached to prevent incomplete fetch/compute pairs
             if overall_step > max_steps or ((self.total_training_steps > 0) and (overall_step > self.total_training_steps)):
@@ -446,8 +444,9 @@ class DLIOBenchmark(object):
                     self.logger.info(f"{utcnow()} Maximum number of steps reached")
                 if (block_step != 1 and self.do_checkpoint) or (not self.do_checkpoint):
                     self.stats.end_block(epoch, block, block_step - 1)
-                dft_ai.pipeline.step.stop()
                 dft_ai.pipeline.step.stop(metadata=True)
+                if self._window is not None:
+                    self._window.stop()
                 break
             self.stats.batch_loaded(epoch, overall_step, block)
             dft_ai.compute.step.start(metadata=True)
@@ -474,8 +473,9 @@ class DLIOBenchmark(object):
                     block_step += 1
             finally:
                 dft_ai.compute.step.stop(metadata=True)
-            dft_ai.pipeline.step.stop()
             dft_ai.pipeline.step.stop(metadata=True)
+            if self._window is not None:
+                self._window.stop()
             overall_step += 1
             # start a new block here
             if block_step == 1 and block != 1:
@@ -525,6 +525,23 @@ class DLIOBenchmark(object):
             if self.do_eval:
                 self.eval_loader = self.framework.get_loader(dataset_type=DatasetType.VALID, epoch=epoch)
                 self.eval_loader.read()
+            # Create analysis window with self-tuning cadence.
+            # Start at min(1000, steps_per_epoch) to keep drain manageable
+            # (~90K events per window at 90 events/step). The optimizer
+            # can adjust cadence via the ack mechanism.
+            _steps_per_epoch = math.floor(
+                self.num_samples * self.num_files_train / self.batch_size / self.comm_size
+            )
+            _initial_every_n = min(1000, _steps_per_epoch)
+            if _HAS_DFOPTIMIZER and dftracer:
+                self._window = Window(
+                    dftracer.get_instance(),
+                    max_every_n=_steps_per_epoch,
+                )
+                self._window.update_cadence(_initial_every_n)
+            else:
+                self._window = None
+
             self.comm.barrier()
             for epoch in dft_ai.pipeline.epoch.iter(range(1, self.epochs + 1), include_iter=False):
                 dft_ai.pipeline.epoch.start(metadata=True)
@@ -539,6 +556,10 @@ class DLIOBenchmark(object):
                 self.stats.start_train(epoch)
                 steps = self._train(epoch, loader)
                 self.stats.end_train(epoch, steps)
+                # Force window boundary at epoch end so analyzer processes
+                # any accumulated events before the next epoch begins.
+                if self._window is not None:
+                    self._window.flush()
                 self.logger.debug(f"{utcnow()} Rank {self.my_rank} returned after {steps} steps.")
                 loader.finalize()
                 # Perform evaluation if enabled
