@@ -16,6 +16,7 @@
 """
 import os
 import math
+import sys
 from time import time
 import numpy as np
 
@@ -80,8 +81,12 @@ class DLIOBenchmark(object):
 
         self.output_folder = self.args.output_folder
         os.makedirs(self.args.output_folder, mode=0o755, exist_ok=True)
+        os.environ["DLIO_OUTPUT_FOLDER"] = self.args.output_folder
         self.comm = DLIOMPI.get_instance().comm()
+        self.local_comm = DLIOMPI.get_instance().local_comm()
         self.my_rank = self.args.my_rank = DLIOMPI.get_instance().rank()
+        self.my_local_rank = self.args.my_local_rank = DLIOMPI.get_instance().local_rank()
+        self.my_node = self.args.my_node = DLIOMPI.get_instance().node()
         self.comm_size = self.args.comm_size = DLIOMPI.get_instance().size()
         self.data_folder = self.args.data_folder
         self.storage_root = self.args.storage_root
@@ -152,6 +157,22 @@ class DLIOBenchmark(object):
             self.epochs_between_evals = self.args.epochs_between_evals
         self.stats = StatsCounter()
 
+    def _emit_optimizer_debug(self, message):
+        if os.environ.get("DFOPTIMIZER_DEBUG", "0") != "1":
+            return
+        if not (self.my_rank == 0 or self.my_local_rank == 0):
+            return
+        try:
+            sys.stderr.write(
+                f"{self.my_rank}: [DLIO_OPT_DEBUG] rank={self.my_rank} "
+                f"local_rank={self.my_local_rank} node={self.my_node} "
+                f"host={os.environ.get('DLIO_MPI_HOSTNAME', os.uname().nodename)} "
+                f"{message}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
+
     @dlp.log
     def initialize(self):
         """
@@ -181,47 +202,73 @@ class DLIOBenchmark(object):
         file_list_eval = []
         num_subfolders = 0
         if self.args.do_train:
-            for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
-                if dataset_type == DatasetType.TRAIN:
-                    num_subfolders = self.num_subfolders_train
-                else:
-                    num_subfolders = self.num_subfolders_eval
-                filenames = self.storage.walk_node(os.path.join(self.args.data_folder, f"{dataset_type}"))
-                self.logger.debug(f"filenames {filenames} {num_subfolders}")
-                if (len(filenames) == 0):
-                    continue
-                if self.storage.get_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}",
-                                    filenames[0])) == MetadataType.DIRECTORY:
-                    assert (num_subfolders == len(filenames))
-                    fullpaths = self.storage.walk_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
-                        use_pattern=True)
-                    files = [self.storage.get_basename(f) for f in fullpaths]
-                    idx = np.argsort(files)
-                    fullpaths = [fullpaths[i] for i in idx]
-                    self.logger.debug(f"fullpaths {fullpaths}")
-                else:
-                    assert (num_subfolders == 0)
-                    fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
-                                for entry in filenames if entry.endswith(f'{self.args.format}')]
-                    fullpaths = sorted(fullpaths)
-                    self.logger.debug(f"fullpaths {fullpaths}")
-                self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
-                if dataset_type is DatasetType.TRAIN:
-                    file_list_train = fullpaths
-                elif dataset_type is DatasetType.VALID:
-                    file_list_eval = fullpaths
-            if not self.generate_only and self.num_files_train > len(file_list_train):
-                raise Exception(
-                    "Not enough training dataset is found; Please run the code with ++workload.workflow.generate_data=True")
-            if self.do_eval and self.num_files_eval > len(file_list_eval):
-                raise Exception(
-                    "Not enough evaluation dataset is found; Please run the code with ++workload.workflow.generate_data=True")
-            if (self.num_files_train < len(file_list_train)):
-                self.logger.warning(
-                    f"Number of files for training in {os.path.join(self.args.data_folder, f'{DatasetType.TRAIN}')} ({len(file_list_train)}) is more than requested ({self.num_files_train}). A subset of files will be used ")
-                file_list_train = file_list_train[:self.num_files_train]
+            # Fast path: build file list synthetically when DLIO_SYNTHETIC_FILE_LIST=1.
+            # Avoids Lustre metadata walk for millions of files (2M+ files can take >60 min).
+            if os.environ.get("DLIO_SYNTHETIC_FILE_LIST", "0") == "1":
+                fmt = self.args.format
+                for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
+                    if dataset_type == DatasetType.TRAIN:
+                        n = self.num_files_train
+                    else:
+                        n = self.num_files_eval if self.do_eval else 0
+                    if n > 0:
+                        base = os.path.join(self.args.data_folder, f"{dataset_type}")
+                        pad = len(str(n - 1)) if n > 0 else 1
+                        fullpaths = [
+                            self.storage.get_uri(os.path.join(base, f"img_{i:0{pad}d}_of_{n}.{fmt}"))
+                            for i in range(n)
+                        ]
+                        if dataset_type is DatasetType.TRAIN:
+                            file_list_train = fullpaths
+                        elif dataset_type is DatasetType.VALID:
+                            file_list_eval = fullpaths
+                if self.my_rank == 0:
+                    self.logger.output(
+                        f"{utcnow()} Synthetic file list: {len(file_list_train)} train, "
+                        f"{len(file_list_eval)} eval (DLIO_SYNTHETIC_FILE_LIST=1)"
+                    )
+            else:
+                for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
+                    if dataset_type == DatasetType.TRAIN:
+                        num_subfolders = self.num_subfolders_train
+                    else:
+                        num_subfolders = self.num_subfolders_eval
+                    filenames = self.storage.walk_node(os.path.join(self.args.data_folder, f"{dataset_type}"))
+                    self.logger.debug(f"filenames {filenames} {num_subfolders}")
+                    if (len(filenames) == 0):
+                        continue
+                    if self.storage.get_node(
+                            os.path.join(self.args.data_folder, f"{dataset_type}",
+                                        filenames[0])) == MetadataType.DIRECTORY:
+                        assert (num_subfolders == len(filenames))
+                        fullpaths = self.storage.walk_node(
+                            os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
+                            use_pattern=True)
+                        files = [self.storage.get_basename(f) for f in fullpaths]
+                        idx = np.argsort(files)
+                        fullpaths = [fullpaths[i] for i in idx]
+                        self.logger.debug(f"fullpaths {fullpaths}")
+                    else:
+                        assert (num_subfolders == 0)
+                        fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
+                                    for entry in filenames if entry.endswith(f'{self.args.format}')]
+                        fullpaths = sorted(fullpaths)
+                        self.logger.debug(f"fullpaths {fullpaths}")
+                    self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
+                    if dataset_type is DatasetType.TRAIN:
+                        file_list_train = fullpaths
+                    elif dataset_type is DatasetType.VALID:
+                        file_list_eval = fullpaths
+                if not self.generate_only and self.num_files_train > len(file_list_train):
+                    raise Exception(
+                        "Not enough training dataset is found; Please run the code with ++workload.workflow.generate_data=True")
+                if self.do_eval and self.num_files_eval > len(file_list_eval):
+                    raise Exception(
+                        "Not enough evaluation dataset is found; Please run the code with ++workload.workflow.generate_data=True")
+                if (self.num_files_train < len(file_list_train)):
+                    self.logger.warning(
+                        f"Number of files for training in {os.path.join(self.args.data_folder, f'{DatasetType.TRAIN}')} ({len(file_list_train)}) is more than requested ({self.num_files_train}). A subset of files will be used ")
+                    file_list_train = file_list_train[:self.num_files_train]
             if (self.num_files_eval < len(file_list_eval)):
                 self.logger.warning(
                     f"Number of files for evaluation in {os.path.join(self.args.data_folder, f'{DatasetType.VALID}')} ({len(file_list_eval)}) is more than requested ({self.num_files_eval}). A subset of files will be used ")
@@ -242,13 +289,27 @@ class DLIOBenchmark(object):
         self.comm.barrier()
 
     def _ensure_optimizer_runtime_started(self):
-        if (
-            self._optimizer_started
-            or not _HAS_DFOPTIMIZER
-            or os.environ.get("DFOPTIMIZER_ENABLE", "0") != "1"
-            or self.my_rank != 0
-        ):
+        skip_reasons = []
+        if self._optimizer_started:
+            skip_reasons.append("already_started")
+        if not _HAS_DFOPTIMIZER:
+            skip_reasons.append("dfoptimizer_missing")
+        if os.environ.get("DFOPTIMIZER_ENABLE", "0") != "1":
+            skip_reasons.append("dfoptimizer_disabled")
+        if self.my_local_rank != 0:
+            skip_reasons.append("not_local_rank_zero")
+        if skip_reasons:
+            if self.my_rank == 0 or self.my_local_rank == 0:
+                self._emit_optimizer_debug(
+                    "optimizer_runtime_skipped "
+                    f"reasons={','.join(skip_reasons)} "
+                    f"group_file={os.environ.get('DFTRACER_MOFKA_GROUP_FILE', '')}"
+                )
             return
+        self._emit_optimizer_debug(
+            "optimizer_runtime_start "
+            f"group_file={os.environ.get('DFTRACER_MOFKA_GROUP_FILE', '')}"
+        )
 
         group_file = os.environ.get("DFTRACER_MOFKA_GROUP_FILE", "")
         self._optimizer_ctx = optimizer_context(
@@ -271,7 +332,9 @@ class DLIOBenchmark(object):
                         "read_threads": self.args.read_threads,
                     },
                 )
+                self._emit_optimizer_debug("optimizer_knobs_preregistered")
         except Exception as ex:
+            self._emit_optimizer_debug(f"optimizer_knobs_preregister_failed error={ex}")
             self.logger.warning(f"{utcnow()} Failed to pre-register optimizer knobs: {ex}")
 
     @dft_ai.pipeline.evaluate
@@ -366,17 +429,19 @@ class DLIOBenchmark(object):
         to avoid per-epoch fork/init overhead.  A new DataLoader is created
         only when knob values actually change.
 
-        Rank 0 receives overrides from the @tunable decorator; values are
-        then broadcast to all ranks so every process uses the same settings.
+        Each node's local-rank-0 process receives overrides from the
+        @tunable decorator; values are then broadcast within the node so
+        every local worker uses the same settings.
         """
         if prefetch_size is None:
             prefetch_size = self.args.prefetch_size
         if read_threads is None:
             read_threads = self.args.read_threads
 
-        # Broadcast knob values from rank 0 to ensure consistency
+        # Broadcast knob values from local rank 0 so per-node optimizers can
+        # tune different nodes independently.
         knobs = [prefetch_size, read_threads]
-        knobs = self.comm.bcast(knobs, root=0)
+        knobs = self.local_comm.bcast(knobs, root=0)
         prefetch_size, read_threads = knobs
 
         self.args.prefetch_size = prefetch_size
@@ -392,6 +457,22 @@ class DLIOBenchmark(object):
                 self.logger.output(
                     f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size}"
                     f" threads={read_threads} (cached)"
+                )
+            loader = self._cached_loader
+        elif (
+            self._cached_loader is not None
+            and hasattr(self._cached_loader, 'reconfigure')
+        ):
+            # LiveDataLoader: reconfigure in-place, return same object so
+            # the active batch_iter generator in _train stays alive.
+            self._cached_loader.reconfigure(
+                read_threads=read_threads, prefetch_size=prefetch_size)
+            self._cached_prefetch = prefetch_size
+            self._cached_read_threads = read_threads
+            if self.my_rank == 0:
+                self.logger.output(
+                    f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size}"
+                    f" threads={read_threads} (reconfigure)"
                 )
             loader = self._cached_loader
         else:
@@ -475,7 +556,21 @@ class DLIOBenchmark(object):
                 dft_ai.compute.step.stop(metadata=True)
             dft_ai.pipeline.step.stop(metadata=True)
             if self._window is not None:
-                self._window.stop()
+                at_boundary = self._window.stop()
+                # Mid-epoch plan application: at window boundaries, check if
+                # the optimizer has published new knobs. If so, rebuild the
+                # loader with updated parallelism (e.g., read_threads).
+                if at_boundary:
+                    new_loader = self.make_loader(
+                        epoch=epoch,
+                        prefetch_size=self.args.prefetch_size,
+                        read_threads=self.args.read_threads,
+                        _apply_at="window_boundary",
+                    )
+                    if new_loader is not loader:
+                        loader.finalize()
+                        loader = new_loader
+                        batch_iter = loader.next()
             overall_step += 1
             # start a new block here
             if block_step == 1 and block != 1:
@@ -526,13 +621,17 @@ class DLIOBenchmark(object):
                 self.eval_loader = self.framework.get_loader(dataset_type=DatasetType.VALID, epoch=epoch)
                 self.eval_loader.read()
             # Create analysis window with self-tuning cadence.
-            # Start at min(1000, steps_per_epoch) to keep drain manageable
-            # (~90K events per window at 90 events/step). The optimizer
-            # can adjust cadence via the ack mechanism.
+            # Default: ~5 windows per epoch — enough for mid-epoch tuning
+            # without thrashing the pipeline on high-step workloads (e.g.,
+            # CosmoFlow has 98K steps/epoch; old min(1000, N) gave 98 windows).
+            # DLIO_WINDOW_EVERY_N env var overrides this default.
             _steps_per_epoch = math.floor(
                 self.num_samples * self.num_files_train / self.batch_size / self.comm_size
             )
-            _initial_every_n = min(1000, _steps_per_epoch)
+            _default_every_n = max(1, _steps_per_epoch // 5)
+            _initial_every_n = int(os.environ.get(
+                "DLIO_WINDOW_EVERY_N", _default_every_n
+            ))
             if _HAS_DFOPTIMIZER and dftracer:
                 self._window = Window(
                     dftracer.get_instance(),
@@ -607,7 +706,7 @@ class DLIOBenchmark(object):
             # Save collected stats to disk
             self.stats.finalize()
             self.stats.save_data()
-        if self.my_rank == 0 and self._optimizer_ctx is not None:
+        if self.my_local_rank == 0 and self._optimizer_ctx is not None:
             try:
                 self.logger.info(f"{utcnow()} Stopping optimizer runtime context")
                 self._optimizer_ctx.stop()
@@ -622,26 +721,43 @@ class DLIOBenchmark(object):
 
 # Apply @tunable decorator to make_loader if dfoptimizer is available.
 if _HAS_DFOPTIMIZER:
+    _knob_boundary = os.environ.get("DLIO_KNOB_BOUNDARY", "window_boundary")
+    _knob_min_threads = int(os.environ.get("DLIO_KNOB_MIN_THREADS", "0"))
+    _knob_max_threads = int(os.environ.get(
+        "DLIO_KNOB_MAX_THREADS", str(os.cpu_count() or 8)
+    ))
+    if _knob_min_threads > _knob_max_threads:
+        _knob_min_threads = _knob_max_threads
     DLIOBenchmark.make_loader = tunable(knobs={
         "prefetch_size": knob(
             default=2, range=(1, 16), type=int,
             responds_to={
                 "dataloader_prefetch": {
                     "direction": "increase",
+                    "step_mode": "add",
                     "step": 2,
-                    "min_persistence": 2,
-                    "cooldown_windows": 4,
+                    "min_persistence": 1,
+                    "cooldown_windows": 2,
+                    "apply_when": _knob_boundary,
                 },
             },
         ),
         "read_threads": knob(
-            default=0, range=(0, 16), type=int,
+            default=max(0, _knob_min_threads), range=(_knob_min_threads, _knob_max_threads), type=int,
             responds_to={
                 "reader_parallelism": {
                     "direction": "increase",
+                    "step_mode": "evidence",
+                    "min_persistence": 1,
+                    "cooldown_windows": 1,
+                    "apply_when": _knob_boundary,
+                },
+                "reader_contention": {
+                    "direction": "decrease",
                     "step": 1,
                     "min_persistence": 2,
-                    "cooldown_windows": 4,
+                    "cooldown_windows": 3,
+                    "apply_when": _knob_boundary,
                 },
             },
         ),

@@ -16,6 +16,7 @@
 """
 
 import os
+import sys
 from datetime import datetime
 import logging
 from time import time, sleep as base_sleep
@@ -37,6 +38,8 @@ from dftracer.python import (
 )
 
 LOG_TS_FORMAT = "%Y-%m-%dT%H:%M:%S.%f"
+_FETCH_DELAY_CFG = None
+_FETCH_DELAY_LOGGED_PIDS = set()
 
 OUTPUT_LEVEL = 35
 logging.addLevelName(OUTPUT_LEVEL, "OUTPUT")
@@ -117,6 +120,7 @@ class DLIOMPI:
             
             self.mpi_state = MPIState.MPI_INITIALIZED
             split_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+            self.mpi_local_comm = split_comm
             # Number of processes on this node and local rank
             local_ppn = split_comm.size
             self.mpi_local_rank = split_comm.rank
@@ -144,6 +148,11 @@ class DLIOMPI:
                 if self.mpi_rank >= off and self.mpi_rank < off + self.mpi_ppn_list[idx]:
                     self.mpi_node = idx
                     break
+            os.environ["DLIO_MPI_NODE_INDEX"] = str(self.mpi_node)
+            os.environ["DLIO_MPI_LOCAL_RANK"] = str(self.mpi_local_rank)
+            os.environ["DLIO_MPI_NUM_NODES"] = str(self.mpi_nodes)
+            os.environ["DLIO_MPI_GLOBAL_RANK"] = str(self.mpi_rank)
+            os.environ["DLIO_MPI_HOSTNAME"] = socket.gethostname()
         elif self.mpi_state == MPIState.CHILD_INITIALIZED:
             raise Exception(f"method {self.classname()}.initialize() called in a child process")
         else:
@@ -157,6 +166,12 @@ class DLIOMPI:
             self.mpi_rank = parent_rank
             self.mpi_size = parent_comm_size
             self.mpi_world = None
+            self.mpi_local_comm = None
+            self.mpi_local_rank = int(os.environ.get("DLIO_MPI_LOCAL_RANK", "0") or 0)
+            self.mpi_node = int(os.environ.get("DLIO_MPI_NODE_INDEX", "0") or 0)
+            self.mpi_nodes = int(os.environ.get("DLIO_MPI_NUM_NODES", "1") or 1)
+            self.mpi_ppn_list = []
+            os.environ["DLIO_MPI_GLOBAL_RANK"] = str(parent_rank)
         elif self.mpi_state == MPIState.MPI_INITIALIZED:
             raise Exception(f"method {self.classname()}.set_parent_values() called in a MPI process")
         else:
@@ -181,6 +196,14 @@ class DLIOMPI:
             raise Exception(f"method {self.classname()}.comm() called in a child process")
         else:
             raise Exception(f"method {self.classname()}.comm() called before initializing MPI")
+
+    def local_comm(self):
+        if self.mpi_state == MPIState.MPI_INITIALIZED:
+            return self.mpi_local_comm
+        elif self.mpi_state == MPIState.CHILD_INITIALIZED:
+            raise Exception(f"method {self.classname()}.local_comm() called in a child process")
+        else:
+            raise Exception(f"method {self.classname()}.local_comm() called before initializing MPI")
 
     def local_rank(self):
         if self.mpi_state == MPIState.UNINITIALIZED:
@@ -322,6 +345,117 @@ def sleep(config):
     if sleep_time > 0.0:
         base_sleep(sleep_time)
     return sleep_time
+
+
+def _parse_csv_set(raw_value, cast=None):
+    values = set()
+    if not raw_value:
+        return values
+    for token in raw_value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        values.add(cast(token) if cast is not None else token)
+    return values
+
+
+def _fetch_delay_config():
+    global _FETCH_DELAY_CFG
+    if _FETCH_DELAY_CFG is not None:
+        return _FETCH_DELAY_CFG
+    delay_sec = float(os.environ.get("DLIO_INJECT_FETCH_DELAY_SEC", "0") or 0.0)
+    _FETCH_DELAY_CFG = {
+        "delay_sec": max(delay_sec, 0.0),
+        "node_indexes": _parse_csv_set(
+            os.environ.get("DLIO_INJECT_FETCH_DELAY_NODE_INDEXES", ""),
+            cast=int,
+        ),
+        "global_ranks": _parse_csv_set(
+            os.environ.get("DLIO_INJECT_FETCH_DELAY_GLOBAL_RANKS", ""),
+            cast=int,
+        ),
+        "hosts": {host.lower() for host in _parse_csv_set(
+            os.environ.get("DLIO_INJECT_FETCH_DELAY_HOSTS", ""),
+        )},
+    }
+    return _FETCH_DELAY_CFG
+
+
+def maybe_inject_fetch_delay(logger=None, *, location="fetch"):
+    cfg = _fetch_delay_config()
+    if cfg["delay_sec"] <= 0.0:
+        return 0.0
+
+    hostname = os.environ.get("DLIO_MPI_HOSTNAME", socket.gethostname())
+    short_hostname = hostname.split(".", 1)[0].lower()
+
+    target_by_index = bool(cfg["node_indexes"])
+    target_by_rank = bool(cfg["global_ranks"])
+    target_by_host = bool(cfg["hosts"])
+    if not target_by_index and not target_by_rank and not target_by_host:
+        matched = True
+    else:
+        matched = False
+        node_index = os.environ.get("DLIO_MPI_NODE_INDEX", "")
+        if target_by_index and node_index:
+            try:
+                matched = int(node_index) in cfg["node_indexes"]
+            except ValueError:
+                matched = False
+        rank_label = os.environ.get(
+            "DLIO_MPI_GLOBAL_RANK",
+            os.environ.get("PMIX_RANK", os.environ.get("SLURM_PROCID", "")),
+        )
+        if not matched and target_by_rank and rank_label:
+            try:
+                matched = int(rank_label) in cfg["global_ranks"]
+            except ValueError:
+                matched = False
+        if not matched and target_by_host:
+            matched = (
+                hostname.lower() in cfg["hosts"]
+                or short_hostname in cfg["hosts"]
+            )
+
+    if not matched:
+        return 0.0
+
+    pid = os.getpid()
+    if pid not in _FETCH_DELAY_LOGGED_PIDS:
+        node_label = os.environ.get("DLIO_MPI_NODE_INDEX", "?")
+        rank_label = os.environ.get(
+            "DLIO_MPI_GLOBAL_RANK",
+            os.environ.get("PMIX_RANK", os.environ.get("SLURM_PROCID", "?")),
+        )
+        marker = (
+            f"{utcnow()} inject_fetch_delay active at {location}: "
+            f"delay_sec={cfg['delay_sec']} node_index={node_label} "
+            f"hostname={short_hostname} pid={pid} rank={rank_label}"
+        )
+        if logger is not None:
+            logger.output(marker)
+        try:
+            sys.stderr.write(f"[DLIO_DELAY] {marker}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            output_folder = os.environ.get("DLIO_OUTPUT_FOLDER", "").strip()
+            if output_folder:
+                marker_dir = os.path.join(output_folder, "delay_markers")
+                os.makedirs(marker_dir, exist_ok=True)
+                marker_path = os.path.join(
+                    marker_dir,
+                    f"{short_hostname}-node{node_label}-rank{rank_label}-pid{pid}.log",
+                )
+                with open(marker_path, "a", encoding="utf-8") as marker_file:
+                    marker_file.write(f"[DLIO_DELAY] {marker}\n")
+        except Exception:
+            pass
+        _FETCH_DELAY_LOGGED_PIDS.add(pid)
+
+    base_sleep(cfg["delay_sec"])
+    return cfg["delay_sec"]
 
 def gen_random_tensor(shape, dtype, rng=None):
     if rng is None:

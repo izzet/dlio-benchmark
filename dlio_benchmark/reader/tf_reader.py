@@ -17,7 +17,7 @@
 import math
 
 from dlio_benchmark.common.constants import MODULE_DATA_READER
-from dlio_benchmark.utils.utility import utcnow, Profile
+from dlio_benchmark.utils.utility import utcnow, Profile, maybe_inject_fetch_delay
 from dlio_benchmark.common.enumerations import Shuffle
 from dlio_benchmark.reader.reader_handler import FormatReader
 import tensorflow as tf
@@ -59,6 +59,7 @@ class TFReader(FormatReader):
         :param serialized: is the serialized version using protobuf
         :return: deserialized image and label.
         """
+        maybe_inject_fetch_delay(self.logger, location=f"{self.__class__.__qualname__}._parse_image")
         features = \
             {
                 'image': tf.io.FixedLenFeature([], tf.string),

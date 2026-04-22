@@ -20,7 +20,7 @@ import numpy as np
 
 from dlio_benchmark.common.enumerations import DatasetType, ReadType
 from dlio_benchmark.utils.utility import utcnow
-from dlio_benchmark.utils.utility import Profile, sleep, dft_ai
+from dlio_benchmark.utils.utility import Profile, sleep, dft_ai, maybe_inject_fetch_delay
 from dlio_benchmark.utils.config import ConfigArguments
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 
@@ -82,6 +82,10 @@ class FormatReader(ABC):
             if filename not in self.open_file_map or self.open_file_map[filename] is None:
                 self.open_file_map[filename] = self.open(filename)
             self.get_sample(filename, sample_index)
+            maybe_inject_fetch_delay(
+                self.logger,
+                location=f"{self.__class__.__qualname__}.next",
+            )
             self.preprocess()
             batch.append(self._args.resized_image)
             image_processed += 1
@@ -113,6 +117,10 @@ class FormatReader(ABC):
         if self._args.read_type is ReadType.ON_DEMAND or filename not in self.open_file_map or self.open_file_map[filename] is None:
             self.open_file_map[filename] = self.open(filename)
         self.get_sample(filename, sample_index)
+        maybe_inject_fetch_delay(
+            self.logger,
+            location=f"{self.__class__.__qualname__}.read_index",
+        )
         self.preprocess()
         if self._args.read_type is ReadType.ON_DEMAND:
             self.close(filename)
