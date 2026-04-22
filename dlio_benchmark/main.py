@@ -175,51 +175,77 @@ class DLIOBenchmark(object):
         file_list_eval = []
         num_subfolders = 0
         if self.args.do_train:
-            for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
-                if dataset_type == DatasetType.TRAIN:
-                    num_subfolders = self.num_subfolders_train
-                else:
-                    num_subfolders = self.num_subfolders_eval
-                filenames = self.storage.walk_node(os.path.join(self.args.data_folder, f"{dataset_type}"))
-                self.logger.debug(f"filenames {filenames} {num_subfolders}")
-                if (len(filenames) == 0):
-                    continue
-                if self.storage.get_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}",
-                                    filenames[0])) == MetadataType.DIRECTORY:
-                    assert (num_subfolders == len(filenames))
-                    fullpaths = self.storage.walk_node(
-                        os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
-                        use_pattern=True)
-                    files = [self.storage.get_basename(f) for f in fullpaths]
-                    idx = np.argsort(files)
-                    fullpaths = [fullpaths[i] for i in idx]
-                    self.logger.debug(f"fullpaths {fullpaths}")
-                else:
-                    assert (num_subfolders == 0)
-                    fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
-                                for entry in filenames if entry.endswith(f'{self.args.format}')]
-                    fullpaths = sorted(fullpaths)
-                    self.logger.debug(f"fullpaths {fullpaths}")
-                self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
-                if dataset_type is DatasetType.TRAIN:
-                    file_list_train = fullpaths
-                elif dataset_type is DatasetType.VALID:
-                    file_list_eval = fullpaths
-            if not self.generate_only and self.num_files_train > len(file_list_train):
-                raise Exception(
-                    "Not enough training dataset is found; Please run the code with ++workload.workflow.generate_data=True")
-            if self.do_eval and self.num_files_eval > len(file_list_eval):
-                raise Exception(
-                    "Not enough evaluation dataset is found; Please run the code with ++workload.workflow.generate_data=True")
-            if (self.num_files_train < len(file_list_train)):
-                self.logger.warning(
-                    f"Number of files for training in {os.path.join(self.args.data_folder, f'{DatasetType.TRAIN}')} ({len(file_list_train)}) is more than requested ({self.num_files_train}). A subset of files will be used ")
-                file_list_train = file_list_train[:self.num_files_train]
-            if (self.num_files_eval < len(file_list_eval)):
-                self.logger.warning(
-                    f"Number of files for evaluation in {os.path.join(self.args.data_folder, f'{DatasetType.VALID}')} ({len(file_list_eval)}) is more than requested ({self.num_files_eval}). A subset of files will be used ")
-                file_list_eval = file_list_eval[:self.num_files_eval]
+            # Fast path: build file list synthetically when DLIO_SYNTHETIC_FILE_LIST=1.
+            # Avoids Lustre metadata walk for millions of files (2M+ files can take >60 min).
+            if os.environ.get("DLIO_SYNTHETIC_FILE_LIST", "0") == "1":
+                fmt = self.args.format
+                for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
+                    if dataset_type == DatasetType.TRAIN:
+                        n = self.num_files_train
+                    else:
+                        n = self.num_files_eval if self.do_eval else 0
+                    if n > 0:
+                        base = os.path.join(self.args.data_folder, f"{dataset_type}")
+                        pad = len(str(n - 1)) if n > 0 else 1
+                        fullpaths = [
+                            self.storage.get_uri(os.path.join(base, f"img_{i:0{pad}d}_of_{n}.{fmt}"))
+                            for i in range(n)
+                        ]
+                        if dataset_type is DatasetType.TRAIN:
+                            file_list_train = fullpaths
+                        elif dataset_type is DatasetType.VALID:
+                            file_list_eval = fullpaths
+                if self.my_rank == 0:
+                    self.logger.info(
+                        f"{utcnow()} Synthetic file list: {len(file_list_train)} train, "
+                        f"{len(file_list_eval)} eval (DLIO_SYNTHETIC_FILE_LIST=1)"
+                    )
+            else:
+                for dataset_type in [DatasetType.TRAIN, DatasetType.VALID]:
+                    if dataset_type == DatasetType.TRAIN:
+                        num_subfolders = self.num_subfolders_train
+                    else:
+                        num_subfolders = self.num_subfolders_eval
+                    filenames = self.storage.walk_node(os.path.join(self.args.data_folder, f"{dataset_type}"))
+                    self.logger.debug(f"filenames {filenames} {num_subfolders}")
+                    if (len(filenames) == 0):
+                        continue
+                    if self.storage.get_node(
+                            os.path.join(self.args.data_folder, f"{dataset_type}",
+                                        filenames[0])) == MetadataType.DIRECTORY:
+                        assert (num_subfolders == len(filenames))
+                        fullpaths = self.storage.walk_node(
+                            os.path.join(self.args.data_folder, f"{dataset_type}/*/*.{self.args.format}"),
+                            use_pattern=True)
+                        files = [self.storage.get_basename(f) for f in fullpaths]
+                        idx = np.argsort(files)
+                        fullpaths = [fullpaths[i] for i in idx]
+                        self.logger.debug(f"fullpaths {fullpaths}")
+                    else:
+                        assert (num_subfolders == 0)
+                        fullpaths = [self.storage.get_uri(os.path.join(self.args.data_folder, f"{dataset_type}", entry))
+                                    for entry in filenames if entry.endswith(f'{self.args.format}')]
+                        fullpaths = sorted(fullpaths)
+                        self.logger.debug(f"fullpaths {fullpaths}")
+                    self.logger.debug(f"subfolder {num_subfolders} fullpaths {fullpaths}")
+                    if dataset_type is DatasetType.TRAIN:
+                        file_list_train = fullpaths
+                    elif dataset_type is DatasetType.VALID:
+                        file_list_eval = fullpaths
+                if not self.generate_only and self.num_files_train > len(file_list_train):
+                    raise Exception(
+                        "Not enough training dataset is found; Please run the code with ++workload.workflow.generate_data=True")
+                if self.do_eval and self.num_files_eval > len(file_list_eval):
+                    raise Exception(
+                        "Not enough evaluation dataset is found; Please run the code with ++workload.workflow.generate_data=True")
+                if (self.num_files_train < len(file_list_train)):
+                    self.logger.warning(
+                        f"Number of files for training in {os.path.join(self.args.data_folder, f'{DatasetType.TRAIN}')} ({len(file_list_train)}) is more than requested ({self.num_files_train}). A subset of files will be used ")
+                    file_list_train = file_list_train[:self.num_files_train]
+                if (self.num_files_eval < len(file_list_eval)):
+                    self.logger.warning(
+                        f"Number of files for evaluation in {os.path.join(self.args.data_folder, f'{DatasetType.VALID}')} ({len(file_list_eval)}) is more than requested ({self.num_files_eval}). A subset of files will be used ")
+                    file_list_eval = file_list_eval[:self.num_files_eval]
         self.args.derive_configurations(file_list_train, file_list_eval)
         self.args.validate()
         self.checkpointing_mechanism = None
