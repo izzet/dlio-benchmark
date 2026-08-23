@@ -58,6 +58,24 @@ from dlio_benchmark.utils.utility import utcnow, Profile
 dlp = Profile(MODULE_DATA_LOADER)
 
 _GATE = None            # module-level so forked workers inherit the SAME object
+_PREFETCH_DEPTH = None  # mp.Value, must exist before any fork for the same reason
+
+
+def get_prefetch_depth():
+    return _PREFETCH_DEPTH
+
+
+def _make_prefetch_depth(initial, max_depth):
+    """Shared prefetch depth. Created BEFORE any worker is forked, like the gate."""
+    global _PREFETCH_DEPTH
+    if _PREFETCH_DEPTH is None:
+        import multiprocessing as _mp
+        _PREFETCH_DEPTH = _mp.Value("i", max(1, int(initial)), lock=False)
+        _PREFETCH_DEPTH_MAX[0] = int(max_depth)
+    return _PREFETCH_DEPTH
+
+
+_PREFETCH_DEPTH_MAX = [32]
 
 
 def get_gate():
@@ -110,6 +128,7 @@ class LiveFlowDataLoader(BaseDataLoader):
         self._dataset = None
         self._built_workers = None
         self._built_prefetch = None
+        self._prefetch = None
 
     @dlp.log
     def read(self, read_threads=None, prefetch_size=None):
@@ -169,6 +188,20 @@ class LiveFlowDataLoader(BaseDataLoader):
                                    **kwargs)
         self._built_workers = workers
         self._built_prefetch = prefetch_size
+
+        if os.environ.get("LIVEFLOW_DYNAMIC_PREFETCH", "0") == "1":
+            import sys as _sys
+            _p = os.environ.get("LIVEFLOW_SHM_PYTHONPATH")
+            if _p and _p not in _sys.path:
+                _sys.path.insert(0, _p)
+            from dynamic_prefetch import DynamicPrefetch
+            depth = _make_prefetch_depth(prefetch_size or 1,
+                                         int(os.environ.get("LIVEFLOW_MAX_PREFETCH", "32")))
+            self._prefetch = DynamicPrefetch(self._dataset, depth=depth,
+                                             max_depth=_PREFETCH_DEPTH_MAX[0])
+            _mark("DYNAMIC PREFETCH on, depth=%d (prefetch_size is now a live knob)"
+                  % self._prefetch.depth)
+
         _mark("BUILT workers=%d gate=%s limit=%s"
               % (workers, "on" if use_gate else "off",
                  get_gate().limit if use_gate else "n/a"))
@@ -217,7 +250,14 @@ class LiveFlowDataLoader(BaseDataLoader):
         # callers that would rather pay the fork than lose the knob.
         if prefetch_size is not None and self._built_prefetch is not None \
                 and int(prefetch_size) != int(self._built_prefetch):
-            if os.environ.get("LIVEFLOW_GATE_REBUILD_PREFETCH", "0") == "1":
+            if self._prefetch is not None:
+                # Dynamic prefetch owns the depth, so this IS applicable after all.
+                before_d = self._prefetch.depth
+                after_d = self._prefetch.set_depth(prefetch_size)
+                self._built_prefetch = prefetch_size
+                _mark("PREFETCH %s -> %s applied via the dynamic buffer (no rebuild)"
+                      % (before_d, after_d))
+            elif os.environ.get("LIVEFLOW_GATE_REBUILD_PREFETCH", "0") == "1":
                 _mark("PREFETCH %s -> %s requires a rebuild (opted in); rebuilding"
                       % (self._built_prefetch, prefetch_size))
                 self._dataset = None
@@ -232,8 +272,14 @@ class LiveFlowDataLoader(BaseDataLoader):
     @dlp.log
     def next(self):
         super().next()
-        for batch in self._dataset:
-            yield batch
+        # With dynamic prefetch on, the training loop consumes through a bounded buffer whose
+        # depth is a live knob. Off by default: this sits in the data path.
+        if self._prefetch is not None:
+            for batch in self._prefetch:
+                yield batch
+        else:
+            for batch in self._dataset:
+                yield batch
 
     @dlp.log
     def finalize(self):
@@ -243,6 +289,8 @@ class LiveFlowDataLoader(BaseDataLoader):
         # microbenchmark; that is not the same as it doing real work inside DLIO, where the
         # limit may simply never bind. A gate that never blocks is not throttling anything, and
         # saying so is more useful than assuming it worked.
+        if self._prefetch is not None:
+            _mark("PREFETCH STATS %s" % self._prefetch.stats())
         gate = get_gate()
         if gate is not None:
             st = gate.stats()
