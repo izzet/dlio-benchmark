@@ -203,4 +203,15 @@ class LiveFlowDataLoader(BaseDataLoader):
     @dlp.log
     def finalize(self):
         # Deliberately does NOT tear down the loader: persistent workers are the point.
-        pass
+        #
+        # Report what the gate actually DID. G1/G2 prove the mechanism throttles in a
+        # microbenchmark; that is not the same as it doing real work inside DLIO, where the
+        # limit may simply never bind. A gate that never blocks is not throttling anything, and
+        # saying so is more useful than assuming it worked.
+        gate = get_gate()
+        if gate is not None:
+            st = gate.stats()
+            _mark("GATE STATS limit=%d waits=%d wait_ms=%.0f  %s"
+                  % (st["limit"], st["waits"], st["wait_ms"],
+                     "(gate never blocked -- limit did not bind)" if st["waits"] == 0
+                     else "(gate blocked workers -- throttling was real)"))
