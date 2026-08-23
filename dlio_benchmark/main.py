@@ -296,7 +296,27 @@ class DLIOBenchmark(object):
             skip_reasons.append("dfoptimizer_missing")
         if os.environ.get("DFOPTIMIZER_ENABLE", "0") != "1":
             skip_reasons.append("dfoptimizer_disabled")
-        if self.my_local_rank != 0:
+        # WHO GETS AN OPTIMIZER CONTEXT.
+        #
+        # Restricting this to local rank 0 is CONTAINMENT, not design. Under Mofka every context
+        # is a consumer living in the application's address space -- another client to fork, more
+        # margo/argobots threads competing with NCCL (sec 57) -- so one per node was a way to
+        # shrink the blast radius of a transport that could hang the rank holding it.
+        #
+        # It buys that at the cost of rank ASYMMETRY: only the holding rank ever learns a knob
+        # changed, so the others keep stale values, and any apply path containing a collective
+        # deadlocks on the ranks that never heard about it. That is sec 78, where a world
+        # collective ran on 4 of 16 ranks.
+        #
+        # A broadcast mailbox removes the reason. A reader is an mmap and a version counter: no
+        # connection, no threads, no progress engine, nothing to re-initialise across fork. Every
+        # rank can afford one, so every rank gets one and symmetry stops being something the
+        # actuator has to remember. Defaults to the old containment under Mofka.
+        _per_rank = os.environ.get(
+            "LIVEFLOW_CTX_PER_RANK",
+            "1" if os.environ.get("LIVEFLOW_TRANSPORT", "mofka").strip().lower() != "mofka"
+            else "0") == "1"
+        if not _per_rank and self.my_local_rank != 0:
             skip_reasons.append("not_local_rank_zero")
         if skip_reasons:
             if self.my_rank == 0 or self.my_local_rank == 0:

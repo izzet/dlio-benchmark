@@ -15,6 +15,7 @@
    limitations under the License.
 """
 import math
+import os
 
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 from dlio_benchmark.utils.utility import utcnow, Profile, maybe_inject_fetch_delay
@@ -93,6 +94,14 @@ class TFReader(FormatReader):
         if len(self._file_list) == 0:
             return []
 
+        # LiveIO: true tf.data.AUTOTUNE arm, gated by env var so it never affects
+        # the fixed-read_threads sweep runs. When on, tf.data picks read/map/prefetch
+        # parallelism itself (the storage-blind autotuner baseline).
+        _autotune = os.environ.get("DLIO_TF_AUTOTUNE", "0") == "1"
+        _num_parallel_reads = tf.data.AUTOTUNE if _autotune else read_threads
+        _num_parallel_calls = tf.data.AUTOTUNE if _autotune else self._args.computation_threads
+        _prefetch_buffer = tf.data.AUTOTUNE if _autotune else prefetch_size
+
         filenames = tf.data.Dataset.list_files(self._file_list, shuffle=False)
         # sharding in the file list if we have enought files.
         if (len(self._file_list) >= self._args.comm_size):
@@ -100,7 +109,7 @@ class TFReader(FormatReader):
             self.logger.debug(f"{utcnow()} shard {filenames} files index {self._args.my_rank} number {self._args.comm_size}")
 
         self._dataset = tf.data.TFRecordDataset(filenames=filenames, buffer_size=self._args.transfer_size,
-                                                num_parallel_reads=read_threads)
+                                                num_parallel_reads=_num_parallel_reads)
 
         if self._args.sample_shuffle != Shuffle.OFF:
             if self._args.sample_shuffle == Shuffle.SEED:
@@ -116,12 +125,12 @@ class TFReader(FormatReader):
         self._dataset = self._dataset.batch(self.batch_size, drop_remainder=True)
         self._dataset = self._dataset.map(
                 lambda x: tf.py_function(func=self._parse_image, inp=[x], Tout=[tf.uint8]),
-                num_parallel_calls=self._args.computation_threads)
+                num_parallel_calls=_num_parallel_calls)
 
         self._dataset = self._dataset.repeat()
         total = math.floor(len(self._file_list)/self._args.comm_size / self.batch_size * self._args.num_samples_per_file)
 
-        return self._dataset.take(total*self._args.epochs).prefetch(buffer_size=prefetch_size)
+        return self._dataset.take(total*self._args.epochs).prefetch(buffer_size=_prefetch_buffer)
     
     @dlp.log
     def read_index(self, image_idx, step):
