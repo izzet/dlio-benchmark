@@ -89,8 +89,16 @@ class GatedTorchDataset(TorchDataset):
         gate = get_gate()
         if gate is None:
             return super().__getitem__(image_idx)
-        with gate:
+        # Explicit token rather than `with gate:`. The context-manager form has to stash whether
+        # it actually acquired (the gate has a bypass fast path when the limit cannot bind), and
+        # stashing that on the gate instance is only safe because each DataLoader worker is its
+        # own PROCESS calling this sequentially. Passing the token makes the contract local and
+        # keeps it correct if a caller ever becomes threaded.
+        token = gate.acquire()
+        try:
             return super().__getitem__(image_idx)
+        finally:
+            gate.release(token)
 
 
 class LiveFlowDataLoader(BaseDataLoader):
@@ -101,6 +109,7 @@ class LiveFlowDataLoader(BaseDataLoader):
         super().__init__(format_type, dataset_type, epoch, data_loader_type)
         self._dataset = None
         self._built_workers = None
+        self._built_prefetch = None
 
     @dlp.log
     def read(self, read_threads=None, prefetch_size=None):
@@ -159,6 +168,7 @@ class LiveFlowDataLoader(BaseDataLoader):
                                    drop_last=True,
                                    **kwargs)
         self._built_workers = workers
+        self._built_prefetch = prefetch_size
         _mark("BUILT workers=%d gate=%s limit=%s"
               % (workers, "on" if use_gate else "off",
                  get_gate().limit if use_gate else "n/a"))
@@ -193,6 +203,31 @@ class LiveFlowDataLoader(BaseDataLoader):
         after = gate.set_limit(read_threads)
         _mark("RECONFIGURE gate %d -> %d mid-epoch (same loader, same iterator, no fork)"
               % (before, after))
+
+        # PREFETCH IS NOT GATEABLE, AND SAYING SO MATTERS.
+        #
+        # torch's `prefetch_factor` is a constructor argument with no runtime setter, so unlike
+        # read_threads it cannot be moved by a limit. Under the gate the DataLoader is never
+        # rebuilt, which means a prefetch_size change would be SILENTLY ignored -- the knob would
+        # appear to apply, the optimizer would ack it, the gates would record it as a successful
+        # action, and nothing would have changed. That is the worst available outcome and exactly
+        # the failure mode this work has been finding elsewhere.
+        #
+        # So it is reported, and LIVEFLOW_GATE_REBUILD_PREFETCH=1 opts into a real rebuild for
+        # callers that would rather pay the fork than lose the knob.
+        if prefetch_size is not None and self._built_prefetch is not None \
+                and int(prefetch_size) != int(self._built_prefetch):
+            if os.environ.get("LIVEFLOW_GATE_REBUILD_PREFETCH", "0") == "1":
+                _mark("PREFETCH %s -> %s requires a rebuild (opted in); rebuilding"
+                      % (self._built_prefetch, prefetch_size))
+                self._dataset = None
+                self._built_workers = None
+                self.read(read_threads=read_threads, prefetch_size=prefetch_size)
+            else:
+                _mark("PREFETCH %s -> %s NOT APPLIED: prefetch_factor is a torch constructor "
+                      "argument and cannot be gated. Set LIVEFLOW_GATE_REBUILD_PREFETCH=1 to "
+                      "rebuild instead of ignoring it."
+                      % (self._built_prefetch, prefetch_size))
 
     @dlp.log
     def next(self):
