@@ -34,6 +34,7 @@ semantics and A/B the two.
 import math
 import os
 import sys
+import time
 
 
 def _mark(msg):
@@ -53,7 +54,7 @@ from dlio_benchmark.common.constants import MODULE_DATA_LOADER
 from dlio_benchmark.common.enumerations import DatasetType, DataLoaderType
 from dlio_benchmark.data_loader.base_data_loader import BaseDataLoader
 from dlio_benchmark.data_loader.torch_data_loader import TorchDataset, dlio_sampler
-from dlio_benchmark.utils.utility import utcnow, Profile
+from dlio_benchmark.utils.utility import utcnow, Profile, dft_ai
 
 dlp = Profile(MODULE_DATA_LOADER)
 
@@ -129,6 +130,13 @@ class LiveFlowDataLoader(BaseDataLoader):
         self._built_workers = None
         self._built_prefetch = None
         self._prefetch = None
+        # None = build the worker pool at MAX. Set to an int only when reconfigure() decides a
+        # deep cut is cheaper to fork than to park.
+        self._pool_width = None
+        # Critical-path accounting: time the training loop spent BLOCKED waiting for a batch.
+        self._stall_s = 0.0
+        self._steps = 0
+        self._stall_mark = (0.0, 0)   # last reported (stall_s, steps), for per-window deltas
 
     @dlp.log
     def read(self, read_threads=None, prefetch_size=None):
@@ -148,7 +156,10 @@ class LiveFlowDataLoader(BaseDataLoader):
             if before != after:
                 _mark("GATE %d -> %d  (knob applied without touching the DataLoader)"
                       % (before, after))
-            workers = max_workers
+            # `_pool_width` is normally None, meaning "build at MAX and let the gate carry every
+            # change". reconfigure() sets it only to narrow the pool for a deep cut, where parking
+            # would cost more than forking (see the note there).
+            workers = getattr(self, "_pool_width", None) or max_workers
         else:
             workers = max(0, int(read_threads))
 
@@ -232,6 +243,53 @@ class LiveFlowDataLoader(BaseDataLoader):
             self._built_workers = None
             self.read(read_threads=read_threads, prefetch_size=prefetch_size)
             return
+        # A DEEP CUT IS CHEAPER TO FORK THAN TO PARK, AND THAT IS MEASURED, NOT ASSUMED.
+        #
+        # Parking a worker does not remove its turn: torch's DataLoader delivers batches in WORKER
+        # ORDER, so a parked worker head-of-line blocks the consumer while the rest of the pool has
+        # capacity. Phase 20 priced this -- applying the same four plans cost +19.2% through the
+        # gate against +3.2% through a rebuild, purely because the sequence cut concurrency to 2
+        # against 8 forked workers.
+        #
+        # Making the gate FIFO did NOT fix it (phase 21). Fair admission orders waiters by ARRIVAL,
+        # but the consumer is waiting on a specific WORKER, so a fairly-admitted worker is still
+        # the wrong one. That is why the fix has to be here rather than in the gate.
+        #
+        # Shallow cuts are fine and must stay free: the pool is built at MAX and the steady state
+        # already sits below it (read_threads=4 of 8 parks half the pool and costs nothing
+        # measurable). Only a deep cut is worth a fork, so the pool tracks the limit only when the
+        # limit drops below `LIVEFLOW_GATE_PARK_RATIO` of it. The trade is explicit: one fork now,
+        # against every subsequent batch paying head-of-line blocking.
+        built = self._built_workers or 0
+        want = max(1, int(read_threads))
+        ratio = float(os.environ.get("LIVEFLOW_GATE_PARK_RATIO", "0.5"))
+        shrink = os.environ.get("LIVEFLOW_GATE_SHRINK", "1") == "1"
+
+        # A pool narrower than the limit cannot deliver the limit. Raising the knob above the
+        # forked width would otherwise be applied to the gate, acked, and recorded as a successful
+        # action while concurrency stayed pinned at the old width -- the silently-ignored knob this
+        # work keeps finding. Growing back to MAX costs one fork and makes every later move free.
+        if built and want > built:
+            _mark("RECONFIGURE gate -> %d exceeds the %d forked workers; regrowing the pool "
+                  "(a wider limit cannot be delivered by a narrower pool)" % (want, built))
+            self._pool_width = None          # None means "build at MAX"
+            self._dataset = None
+            self._built_workers = None
+            self.read(read_threads=read_threads, prefetch_size=prefetch_size)
+            return
+
+        if shrink and built > 1 and want < max(1, int(built * ratio)):
+            _mark("RECONFIGURE gate %d -> %d is a DEEP CUT (%d workers forked); shrinking the pool "
+                  "instead of parking %d of them"
+                  % (gate.limit, want, built, built - want))
+            # Build at exactly the requested width, so worker count equals concurrency and no
+            # worker is ever parked. A later move up regrows the pool via the branch above.
+            self._pool_width = want
+            self._dataset = None
+            self._built_workers = None
+            self.read(read_threads=read_threads, prefetch_size=prefetch_size)
+            return
+
         before = gate.limit
         after = gate.set_limit(read_threads)
         _mark("RECONFIGURE gate %d -> %d mid-epoch (same loader, same iterator, no fork)"
@@ -272,14 +330,56 @@ class LiveFlowDataLoader(BaseDataLoader):
     @dlp.log
     def next(self):
         super().next()
-        # With dynamic prefetch on, the training loop consumes through a bounded buffer whose
-        # depth is a live knob. Off by default: this sits in the data path.
-        if self._prefetch is not None:
-            for batch in self._prefetch:
-                yield batch
-        else:
-            for batch in self._dataset:
-                yield batch
+        # THE CRITICAL-PATH MEASUREMENT (sec 83.1).
+        #
+        # `fetch_frac` in dlio.yaml is fetch's share of SUMMED time --
+        # fetch / (fetch + compute) -- which is not the same question as whether fetch is
+        # STALLING the step. A perfectly overlapped pipeline can spend most of its summed time
+        # fetching and cost the training loop nothing, because the next batch is always ready
+        # before it is asked for. The rule cannot tell those apart, which is how it reached
+        # severity=1.000 "unclassified" and moved a knob that phase 19 proved does nothing.
+        #
+        # The distinction is directly observable right here: the time the consumer spends BLOCKED
+        # in __next__ is, by construction, the part of fetch that is on the critical path. If it
+        # is near zero, fetch is fully hidden and no amount of fetch pressure justifies acting.
+        #
+        # Counted per step and reported per epoch, so a window can carry a stall fraction rather
+        # than a share of summed time.
+        # OBSERVATIONAL EQUIVALENCE WITH THE STOCK LOADER IS NOT OPTIONAL.
+        #
+        # `dft_ai.dataloader.fetch.iter` is what produces the `fetch.iter` events the analyzer
+        # aggregates into `fetch_iter_time_proc_max`, which is the metric BOTH terms of
+        # dlio.fetch_pressure.v1 are built from. This loader originally iterated the source
+        # directly and emitted none of them, so under the gated loader the rule had no input and
+        # could not fire at all.
+        #
+        # That is the real reason the gate arm logged 0 applies in the first phase 20 attempt. I
+        # recorded the cause as the gated loader presenting 8 worker processes where the stock
+        # loader presents 4; that difference is real, but this one is sufficient on its own and
+        # was the actual mechanism. A loader that changes what the observer can SEE cannot be
+        # compared against one that does not, and this file is in the observation path.
+        src = self._prefetch if self._prefetch is not None else self._dataset
+        step = 1
+        it = iter(dft_ai.dataloader.fetch.iter(src))
+        while True:
+            t0 = time.monotonic()
+            try:
+                batch = next(it)
+            except StopIteration:
+                break
+            # Only the blocking wait is counted. Everything between two yields is the training
+            # loop's own compute and belongs to nobody else. This measures the same quantity
+            # `fetch.iter` does, independently -- kept as a cross-check and because a per-window
+            # stall delta is needed locally, where the analyzer's per-epoch aggregate is not.
+            self._stall_s += time.monotonic() - t0
+            self._steps += 1
+            dlp.update(step=step)
+            dft_ai.update(step=step)
+            step += 1
+            yield batch
+        self.epoch_number += 1
+        dlp.update(epoch=self.epoch_number)
+        dft_ai.update(epoch=self.epoch_number)
 
     @dlp.log
     def finalize(self):
@@ -289,6 +389,13 @@ class LiveFlowDataLoader(BaseDataLoader):
         # microbenchmark; that is not the same as it doing real work inside DLIO, where the
         # limit may simply never bind. A gate that never blocks is not throttling anything, and
         # saying so is more useful than assuming it worked.
+        # The stall fraction is the number sec 83.1 says the attribution rule is missing. Reported
+        # unconditionally, including when it is ~0, because "fetch is fully hidden" is exactly the
+        # case the rule currently cannot see and acts on anyway.
+        if self._steps:
+            _mark("STALL total=%.3fs steps=%d mean=%.1fms  (consumer blocked waiting for a batch; "
+                  "this is the part of fetch that is ON the critical path)"
+                  % (self._stall_s, self._steps, 1000.0 * self._stall_s / self._steps))
         if self._prefetch is not None:
             _mark("PREFETCH STATS %s" % self._prefetch.stats())
         gate = get_gate()
