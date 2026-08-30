@@ -285,6 +285,14 @@ class DLIOBenchmark(object):
         self._cached_loader = None
         self._cached_prefetch = None
         self._cached_read_threads = None
+        # Which epoch the cached loader was BUILT for. Reusing a loader across an epoch boundary is
+        # unsound on the TF path: tf_data_loader.read() bakes epoch_number into the dataset (the
+        # from_generator interleave at tf_data_loader.py:85,97) while next() increments it, so a
+        # reused loader re-iterates a dataset wired to the PREVIOUS epoch's sample map with 8
+        # interleaved Python generators. Observed at 32 nodes as a single rank of 256 either
+        # segfaulting or wedging immediately after "Starting block 1", with zero steps completed --
+        # once as a SIGSEGV entering epoch 2, once as a 1h44m hang entering epoch 3.
+        self._cached_epoch = None
         self._ensure_optimizer_runtime_started()
         self.comm.barrier()
 
@@ -467,9 +475,13 @@ class DLIOBenchmark(object):
         self.args.prefetch_size = prefetch_size
         self.args.read_threads = read_threads
 
-        # Reuse cached loader if knobs haven't changed
+        # Reuse cached loader only WITHIN an epoch, and only if knobs haven't changed. Crossing an
+        # epoch boundary must rebuild (see _cached_epoch above); line 669's comment already states
+        # the intent -- "Create fresh train loader each epoch" -- which the cache was defeating.
+        same_epoch = self._cached_epoch == epoch
         if (
             self._cached_loader is not None
+            and same_epoch
             and self._cached_prefetch == prefetch_size
             and self._cached_read_threads == read_threads
         ):
@@ -481,6 +493,7 @@ class DLIOBenchmark(object):
             loader = self._cached_loader
         elif (
             self._cached_loader is not None
+            and same_epoch
             and hasattr(self._cached_loader, 'reconfigure')
         ):
             # LiveDataLoader: reconfigure in-place, return same object so
@@ -489,6 +502,7 @@ class DLIOBenchmark(object):
                 read_threads=read_threads, prefetch_size=prefetch_size)
             self._cached_prefetch = prefetch_size
             self._cached_read_threads = read_threads
+            self._cached_epoch = epoch
             if self.my_rank == 0:
                 self.logger.output(
                     f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size}"
@@ -506,6 +520,7 @@ class DLIOBenchmark(object):
             self._cached_loader = loader
             self._cached_prefetch = prefetch_size
             self._cached_read_threads = read_threads
+            self._cached_epoch = epoch
 
         self._ensure_optimizer_runtime_started()
 
