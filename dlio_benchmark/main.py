@@ -575,7 +575,26 @@ class DLIOBenchmark(object):
         epoch_seconds = max(1e-6, now - getattr(self, "_epoch_t0", now))
         self._epoch_t0 = now
         compute_floor = steps * self._comp_seconds(self.args.computation_time)
+        if not hasattr(self, "_knob_exhausted"):
+            self._knob_exhausted, self._pending_probe = {}, None
         stall = max(0.0, epoch_seconds - compute_floor)
+
+        # ---- judge the previous probe before deciding anything new.
+        stall = max(0.0, epoch_seconds - compute_floor)
+        if self._pending_probe is not None:
+            name, stall_before = self._pending_probe
+            rel = (stall_before - stall) / stall_before if stall_before > 0 else 0.0
+            if rel < float(os.environ.get("LIVEFLOW_PROBE_MIN_GAIN", "0.10")):
+                self._knob_exhausted[name] = True
+                if self.my_rank == 0:
+                    self.logger.output(
+                        f"{utcnow()} ACTION probe {name}: stall {stall_before:.1f} -> {stall:.1f}s "
+                        f"({rel:+.1%}) -- EXHAUSTED, escalating")
+            elif self.my_rank == 0:
+                self.logger.output(
+                    f"{utcnow()} ACTION probe {name}: stall {stall_before:.1f} -> {stall:.1f}s "
+                    f"({rel:+.1%}) -- helped, keep going")
+            self._pending_probe = None
 
         dst_root = os.environ.get("LIVEFLOW_LOCAL_ROOT", "/l/ssd/izzet/liveflow")
         dst_dir = os.path.join(dst_root, "train")
@@ -610,8 +629,16 @@ class DLIOBenchmark(object):
             # storage_stall_frac is NOT measurable here (see docstring); pinned at 1.0, and the
             # decode branch is therefore unreachable rather than wrongly reachable.
             exposure={Domain.STORAGE: stall},
-            read_parallelism_saturated=True, decode_parallelism_available=False,
-            prefetch_memory_available=False, free_bytes=free_bytes, shard_bytes=shard_bytes,
+            # LEARNED, not asserted. Hardcoding these forced every decision to staging, which made
+            # the cheapest-first rule unobservable: the policy could never choose a free knob because
+            # the observation said none was available. The controller now PROBES -- it applies the
+            # cheap reversible knob, watches whether the stall actually falls, and marks the knob
+            # exhausted only when it demonstrably does not help. That is what makes escalation from
+            # free to expensive a measurement rather than a hardcoded preference.
+            read_parallelism_saturated=self._knob_exhausted.get("read_threads", False),
+            decode_parallelism_available=not self._knob_exhausted.get("decode_threads", False),
+            prefetch_memory_available=not self._knob_exhausted.get("prefetch_depth", False),
+            free_bytes=free_bytes, shard_bytes=shard_bytes,
             local_read_bps=float(os.environ.get("LIVEFLOW_LOCAL_BPS", "3.08e9")),
             stage_in_bps=float(os.environ.get("LIVEFLOW_STAGE_BPS", "0.545e9")))
 
@@ -620,6 +647,34 @@ class DLIOBenchmark(object):
             self.logger.output(
                 f"{utcnow()} ACTION epoch={epoch} stall={stall:.1f}s floor={compute_floor:.1f}s "
                 f"remaining={obs.epochs_remaining} -> {d.action or 'none'} ({d.reason})")
+        # ---- UNIFIED DISPATCH. Every actuator is applied here, through one path, so the policy's
+        # cheapest-first ordering is what actually decides. The loader is rebuilt at every epoch
+        # boundary, so assigning to self.args IS the actuation for the parallelism knobs -- no
+        # separate @tunable route, no second mechanism to keep in sync.
+        if d.action is None:
+            self._pending_probe = None
+            return
+
+        if d.action in ("read_threads", "prefetch_depth", "decode_threads"):
+            attr = {"read_threads": "read_threads",
+                    "prefetch_depth": "prefetch_size",
+                    "decode_threads": "computation_threads"}[d.action]
+            cur = int(getattr(self.args, attr, 1) or 1)
+            cap = int(os.environ.get("LIVEFLOW_KNOB_CAP", "32"))
+            new = min(cap, max(cur + 1, cur * 2))
+            if new == cur:                      # already at the cap: nothing left to try
+                self._knob_exhausted[d.action] = True
+                self._pending_probe = None
+                return
+            setattr(self.args, attr, new)
+            # Remember what we changed and the stall we changed it against, so the NEXT boundary can
+            # judge whether it helped. A free knob that does not help must be marked exhausted, or
+            # the controller retries it forever and never escalates.
+            self._pending_probe = (d.action, stall)
+            if self.my_rank == 0:
+                self.logger.output(f"{utcnow()} ACTION applied {attr} {cur} -> {new} (probe)")
+            return
+
         if d.action != "staging":
             return
 
