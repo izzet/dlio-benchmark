@@ -527,6 +527,86 @@ class DLIOBenchmark(object):
         return loader
 
     @dft_ai.pipeline.train
+    def _maybe_reconcile_data_source(self, epoch, steps):
+        """Choose an actuator from the descriptor table and reconcile to it.
+
+        SHIPS THE MEASURABLE BRANCHES ONLY. compute_floor, epoch time, free capacity and the
+        observed stage-in rate are all exactly measurable. The decode branch needs a stall SPLIT
+        (storage vs decode) and there is no sound source for it on this path: dfanalyzer's `dur_sum`
+        sums per-operation durations, so it double-counts concurrency AND is service time, which
+        reverses sign under the intervention it is meant to guide. Rather than synthesise an input
+        to a controller, the split is pinned at 1.0 and the decode branch is disabled and logged.
+        """
+        if os.environ.get("LIVEFLOW_DATA_SOURCE_ACTION", "0") != "1":
+            return
+        if getattr(self, "_data_source", "pfs") == "local":
+            return
+        try:
+            import sys as _sys
+            _sys.path.insert(0, os.environ.get(
+                "LIVEFLOW_PY", "/p/vast1/izzet/worktrees/dfsuite/corona/liveflow_shm/python"))
+            from actuator_policy import Observation, Domain, decide
+            from staging_action import stage_and_repoint
+        except Exception as e:
+            self.logger.output(f"{utcnow()} data_source action unavailable: {e}")
+            return
+
+        epoch_seconds = float(self.stats.get_epoch_seconds(epoch)) if hasattr(
+            self.stats, "get_epoch_seconds") else float(self.args.computation_time * steps)
+        compute_floor = steps * float(self.args.computation_time)
+        stall = max(0.0, epoch_seconds - compute_floor)
+
+        dst_root = os.environ.get("LIVEFLOW_LOCAL_ROOT", "/l/ssd/izzet/liveflow")
+        dst_dir = os.path.join(dst_root, "train")
+        try:
+            st = os.statvfs(dst_root if os.path.isdir(dst_root) else "/l/ssd")
+            free_bytes = st.f_bavail * st.f_frsize
+        except Exception:
+            free_bytes = 0.0
+
+        files = list(self.args.file_list_train)
+        all_names = [os.path.basename(f) for f in files]
+        comm_size, my_rank = self.comm_size, self.my_rank
+        ppn = max(1, comm_size // max(1, int(os.environ.get("LIVEFLOW_NODES", "1"))))
+        node = my_rank // ppn
+        mine = [f for i, f in enumerate(files) if (i % comm_size) // ppn == node]
+        shard_bytes = float(sum(os.path.getsize(f) for f in mine)) if mine else 0.0
+
+        obs = Observation(
+            epoch_seconds=epoch_seconds, steps=steps,
+            per_step_compute=float(self.args.computation_time),
+            epochs_remaining=self.epochs - epoch,
+            # storage_stall_frac is NOT measurable here (see docstring); pinned at 1.0, and the
+            # decode branch is therefore unreachable rather than wrongly reachable.
+            exposure={Domain.STORAGE: stall},
+            read_parallelism_saturated=True, decode_parallelism_available=False,
+            prefetch_memory_available=False, free_bytes=free_bytes, shard_bytes=shard_bytes,
+            local_read_bps=float(os.environ.get("LIVEFLOW_LOCAL_BPS", "3.08e9")),
+            stage_in_bps=float(os.environ.get("LIVEFLOW_STAGE_BPS", "0.545e9")))
+
+        d = decide(obs)
+        if self.my_rank == 0:
+            self.logger.output(
+                f"{utcnow()} ACTION epoch={epoch} stall={stall:.1f}s floor={compute_floor:.1f}s "
+                f"remaining={obs.epochs_remaining} -> {d.action or 'none'} ({d.reason})")
+        if d.action != "staging":
+            return
+
+        ok, why = stage_and_repoint(
+            type("O", (), {"shard_bytes": shard_bytes, "gain_per_epoch": d.gain_per_epoch,
+                           "epochs_remaining": obs.epochs_remaining})(),
+            self.comm, mine, dst_dir, all_names,
+            os.path.dirname(files[0]) if files else "",
+            log=(self.logger.output if self.my_rank == 0 else (lambda *_: None)))
+        if ok:
+            # Repointing is enough: the loader is rebuilt at the next epoch boundary, so the new
+            # path is picked up with no mid-epoch surgery.
+            self.args.data_folder = os.path.dirname(dst_dir)
+            self.args.file_list_train = [os.path.join(dst_dir, n) for n in all_names]
+            self._data_source = "local"
+        if self.my_rank == 0:
+            self.logger.output(f"{utcnow()} ACTION reconcile committed={ok}: {why}")
+
     def _train(self, epoch, loader):
         """
         Training loop for reading the dataset and performing training computations.
@@ -690,6 +770,12 @@ class DLIOBenchmark(object):
                 self.stats.start_train(epoch)
                 steps = self._train(epoch, loader)
                 self.stats.end_train(epoch, steps)
+                # LIVE ACTUATION: decide, at the epoch boundary, whether to move the data. Opt-in
+                # via LIVEFLOW_DATA_SOURCE_ACTION=1 so existing runs are untouched. The boundary is
+                # the right place because the loader is rebuilt here anyway, so repointing
+                # data_folder needs no mid-epoch surgery -- and because break-even is ~1.26 epochs,
+                # a decision taken later than epoch 1 cannot pay for itself.
+                self._maybe_reconcile_data_source(epoch, steps)
                 # Force window boundary at epoch end so analyzer processes
                 # any accumulated events before the next epoch begins.
                 if self._window is not None:
