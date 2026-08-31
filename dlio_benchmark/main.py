@@ -449,7 +449,7 @@ class DLIOBenchmark(object):
         if self.comm.rank == 0:
             self.logger.output(f"{utcnow()} Checkpointing write started")
 
-    def make_loader(self, epoch, prefetch_size=None, read_threads=None):
+    def make_loader(self, epoch, prefetch_size=None, read_threads=None, data_source=None):
         """Create or reuse a training DataLoader for the given epoch.
 
         When prefetch_size and read_threads are unchanged from the previous
@@ -465,6 +465,20 @@ class DLIOBenchmark(object):
             prefetch_size = self.args.prefetch_size
         if read_threads is None:
             read_threads = self.args.read_threads
+        # data_source arrives the same way every other knob does -- injected by @tunable from a plan
+        # that came off the SHM mailbox. The RECONCILE lives outside DLIO (liveflow_shm/python), so
+        # the benchmark carries a dispatch, not a policy.
+        if data_source == "local" and getattr(self, "_data_source", "pfs") != "local":
+            try:
+                import sys as _sys
+                _sys.path.insert(0, os.environ.get(
+                    "LIVEFLOW_PY",
+                    "/p/vast1/izzet/worktrees/dfsuite/corona/liveflow_shm/python"))
+                from staging_reconcile import reconcile_data_source
+                if reconcile_data_source(self, epoch):
+                    self._data_source = "local"
+            except Exception as e:
+                self.logger.output(f"{utcnow()} data_source reconcile unavailable: {e}")
 
         # Broadcast knob values from local rank 0 so per-node optimizers can
         # tune different nodes independently.
@@ -543,158 +557,6 @@ class DLIOBenchmark(object):
             return float(next(iter(ct.values()), 0.0))
         return float(ct)
 
-    def _maybe_reconcile_data_source(self, epoch, steps):
-        """Choose an actuator from the descriptor table and reconcile to it.
-
-        SHIPS THE MEASURABLE BRANCHES ONLY. compute_floor, epoch time, free capacity and the
-        observed stage-in rate are all exactly measurable. The decode branch needs a stall SPLIT
-        (storage vs decode) and there is no sound source for it on this path: dfanalyzer's `dur_sum`
-        sums per-operation durations, so it double-counts concurrency AND is service time, which
-        reverses sign under the intervention it is meant to guide. Rather than synthesise an input
-        to a controller, the split is pinned at 1.0 and the decode branch is disabled and logged.
-        """
-        if os.environ.get("LIVEFLOW_DATA_SOURCE_ACTION", "0") != "1":
-            return
-        if getattr(self, "_data_source", "pfs") == "local":
-            return
-        try:
-            import sys as _sys
-            _sys.path.insert(0, os.environ.get(
-                "LIVEFLOW_PY", "/p/vast1/izzet/worktrees/dfsuite/corona/liveflow_shm/python"))
-            from actuator_policy import Observation, Domain, decide
-            from staging_action import stage_and_repoint
-        except Exception as e:
-            self.logger.output(f"{utcnow()} data_source action unavailable: {e}")
-            return
-
-        # Time the epoch here. StatsCounter has no get_epoch_seconds, and the fallback that used
-        # compute_time * steps would have set epoch_seconds EQUAL to the compute floor, making
-        # stall = 0 and the answer always NONE -- a silent always-decline, which is the worst kind
-        # of bug in a controller because it looks like a considered decision.
-        now = time()
-        epoch_seconds = max(1e-6, now - getattr(self, "_epoch_t0", now))
-        self._epoch_t0 = now
-        compute_floor = steps * self._comp_seconds(self.args.computation_time)
-        if not hasattr(self, "_knob_exhausted"):
-            self._knob_exhausted, self._pending_probe = {}, None
-        stall = max(0.0, epoch_seconds - compute_floor)
-
-        # ---- judge the previous probe before deciding anything new.
-        stall = max(0.0, epoch_seconds - compute_floor)
-        if self._pending_probe is not None:
-            name, stall_before = self._pending_probe
-            rel = (stall_before - stall) / stall_before if stall_before > 0 else 0.0
-            if rel < float(os.environ.get("LIVEFLOW_PROBE_MIN_GAIN", "0.10")):
-                self._knob_exhausted[name] = True
-                if self.my_rank == 0:
-                    self.logger.output(
-                        f"{utcnow()} ACTION probe {name}: stall {stall_before:.1f} -> {stall:.1f}s "
-                        f"({rel:+.1%}) -- EXHAUSTED, escalating")
-            elif self.my_rank == 0:
-                self.logger.output(
-                    f"{utcnow()} ACTION probe {name}: stall {stall_before:.1f} -> {stall:.1f}s "
-                    f"({rel:+.1%}) -- helped, keep going")
-            self._pending_probe = None
-
-        dst_root = os.environ.get("LIVEFLOW_LOCAL_ROOT", "/l/ssd/izzet/liveflow")
-        dst_dir = os.path.join(dst_root, "train")
-        try:
-            st = os.statvfs(dst_root if os.path.isdir(dst_root) else "/l/ssd")
-            free_bytes = st.f_bavail * st.f_frsize
-        except Exception:
-            free_bytes = 0.0
-
-        files = list(self.args.file_list_train)
-        all_names = [os.path.basename(f) for f in files]
-        comm_size, my_rank = self.comm_size, self.my_rank
-        ppn = max(1, comm_size // max(1, int(os.environ.get("LIVEFLOW_NODES", "1"))))
-        node = my_rank // ppn
-        # Sharding rule is the FRAMEWORK's, not ours. tf_reader shards STRIDED (r::comm_size);
-        # dlio_sampler shards CONTIGUOUSLY ([r*spp, (r+1)*spp)). Using the wrong one does not fail --
-        # the node stages files its ranks never read and reads the rest over symlinks to the PFS, so
-        # the arm silently shows no speedup.
-        import math as _math
-        if str(getattr(self.args, "framework", "")).lower().find("pytorch") >= 0:
-            spp = _math.ceil(len(files) / comm_size)
-            mine = [f for i, f in enumerate(files)
-                    if min(i // (ppn * spp), comm_size // ppn - 1) == node]
-        else:
-            mine = [f for i, f in enumerate(files) if (i % comm_size) // ppn == node]
-        shard_bytes = float(sum(os.path.getsize(f) for f in mine)) if mine else 0.0
-
-        obs = Observation(
-            epoch_seconds=epoch_seconds, steps=steps,
-            per_step_compute=self._comp_seconds(self.args.computation_time),
-            epochs_remaining=self.epochs - epoch,
-            # storage_stall_frac is NOT measurable here (see docstring); pinned at 1.0, and the
-            # decode branch is therefore unreachable rather than wrongly reachable.
-            exposure={Domain.STORAGE: stall},
-            # LEARNED, not asserted. Hardcoding these forced every decision to staging, which made
-            # the cheapest-first rule unobservable: the policy could never choose a free knob because
-            # the observation said none was available. The controller now PROBES -- it applies the
-            # cheap reversible knob, watches whether the stall actually falls, and marks the knob
-            # exhausted only when it demonstrably does not help. That is what makes escalation from
-            # free to expensive a measurement rather than a hardcoded preference.
-            read_parallelism_saturated=self._knob_exhausted.get("read_threads", False),
-            decode_parallelism_available=not self._knob_exhausted.get("decode_threads", False),
-            prefetch_memory_available=not self._knob_exhausted.get("prefetch_depth", False),
-            free_bytes=free_bytes, shard_bytes=shard_bytes,
-            local_read_bps=float(os.environ.get("LIVEFLOW_LOCAL_BPS", "3.08e9")),
-            stage_in_bps=float(os.environ.get("LIVEFLOW_STAGE_BPS", "0.545e9")))
-
-        d = decide(obs)
-        if self.my_rank == 0:
-            self.logger.output(
-                f"{utcnow()} ACTION epoch={epoch} stall={stall:.1f}s floor={compute_floor:.1f}s "
-                f"remaining={obs.epochs_remaining} -> {d.action or 'none'} ({d.reason})")
-        # ---- UNIFIED DISPATCH. Every actuator is applied here, through one path, so the policy's
-        # cheapest-first ordering is what actually decides. The loader is rebuilt at every epoch
-        # boundary, so assigning to self.args IS the actuation for the parallelism knobs -- no
-        # separate @tunable route, no second mechanism to keep in sync.
-        if d.action is None:
-            self._pending_probe = None
-            return
-
-        if d.action in ("read_threads", "prefetch_depth", "decode_threads"):
-            attr = {"read_threads": "read_threads",
-                    "prefetch_depth": "prefetch_size",
-                    "decode_threads": "computation_threads"}[d.action]
-            cur = int(getattr(self.args, attr, 1) or 1)
-            cap = int(os.environ.get("LIVEFLOW_KNOB_CAP", "32"))
-            new = min(cap, max(cur + 1, cur * 2))
-            if new == cur:                      # already at the cap: nothing left to try
-                self._knob_exhausted[d.action] = True
-                self._pending_probe = None
-                return
-            setattr(self.args, attr, new)
-            # Remember what we changed and the stall we changed it against, so the NEXT boundary can
-            # judge whether it helped. A free knob that does not help must be marked exhausted, or
-            # the controller retries it forever and never escalates.
-            self._pending_probe = (d.action, stall)
-            if self.my_rank == 0:
-                self.logger.output(f"{utcnow()} ACTION applied {attr} {cur} -> {new} (probe)")
-            return
-
-        if d.action != "staging":
-            return
-
-        ok, why = stage_and_repoint(
-            type("O", (), {"shard_bytes": shard_bytes, "gain_per_epoch": d.gain_per_epoch,
-                           "epochs_remaining": obs.epochs_remaining})(),
-            self.comm, mine, dst_dir, all_names,
-            os.path.dirname(files[0]) if files else "",
-            # ONE stager per node. The shard is node-level, so every local rank copying it would do
-            # ppn-times the work to the same paths. All ranks still enter every allreduce.
-            do_copy=(self.my_local_rank == 0), rank=self.my_rank,
-            log=(self.logger.output if self.my_rank == 0 else (lambda *_: None)))
-        if ok:
-            # Repointing is enough: the loader is rebuilt at the next epoch boundary, so the new
-            # path is picked up with no mid-epoch surgery.
-            self.args.data_folder = os.path.dirname(dst_dir)
-            self.args.file_list_train = [os.path.join(dst_dir, n) for n in all_names]
-            self._data_source = "local"
-        if self.my_rank == 0:
-            self.logger.output(f"{utcnow()} ACTION reconcile committed={ok}: {why}")
 
     @dft_ai.pipeline.train
     def _train(self, epoch, loader):
@@ -861,12 +723,11 @@ class DLIOBenchmark(object):
                 self.stats.start_train(epoch)
                 steps = self._train(epoch, loader)
                 self.stats.end_train(epoch, steps)
-                # LIVE ACTUATION: decide, at the epoch boundary, whether to move the data. Opt-in
-                # via LIVEFLOW_DATA_SOURCE_ACTION=1 so existing runs are untouched. The boundary is
-                # the right place because the loader is rebuilt here anyway, so repointing
-                # data_folder needs no mid-epoch surgery -- and because break-even is ~1.26 epochs,
-                # a decision taken later than epoch 1 cannot pay for itself.
-                self._maybe_reconcile_data_source(epoch, steps)
+                # Record what the reconcile will need if a plan arrives. No policy here: the decision
+                # is the optimizer's and reaches us as a `data_source` knob value off the mailbox.
+                self._last_steps = steps
+                self._last_per_step_compute = self._comp_seconds(self.args.computation_time)
+                self._last_epoch_seconds = max(1e-6, time() - getattr(self, "_epoch_t0", time()))
                 # Force window boundary at epoch end so analyzer processes
                 # any accumulated events before the next epoch begins.
                 if self._window is not None:
@@ -950,6 +811,23 @@ if _HAS_DFOPTIMIZER:
                     "step": 2,
                     "min_persistence": 1,
                     "cooldown_windows": 2,
+                    "apply_when": _knob_boundary,
+                },
+            },
+        ),
+        # The staging actuator, expressed as a knob on the SAME path as read_threads/prefetch_size.
+        # It rides the existing plan -> SHM mailbox -> reconcile machinery (verified on this branch:
+        # a published plan moved read_threads 1 -> 2 -> 4 with acks returned). Nothing bespoke.
+        #
+        # It differs from the others only in what reconciling COSTS: 465-1365 s, collective, and
+        # abortable rather than instantly reversible. That is what ActionDef exists to express; the
+        # transport does not care.
+        "data_source": knob(
+            default="pfs", type=str, values=["pfs", "local"],
+            responds_to={
+                "storage_starved": {
+                    "direction": "set", "set_to": "local",
+                    "min_persistence": 1, "cooldown_windows": 999,
                     "apply_when": _knob_boundary,
                 },
             },
