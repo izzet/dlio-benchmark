@@ -527,6 +527,23 @@ class DLIOBenchmark(object):
         return loader
 
     @dft_ai.pipeline.train
+    @staticmethod
+    def _comp_seconds(ct):
+        """computation_time may be a scalar OR a distribution dict.
+
+        DLIO accepts e.g. {'mean': 0.00936, 'stdev': ...} and its own log prints
+        "(set value: {'mean': 0.00936})". Multiplying that by a step count raised
+        TypeError: unsupported operand type(s) for *: 'dict' and 'int' -- which killed the first
+        live-controller run AFTER epoch 1 had already completed, so the failure looked like a
+        crash rather than a type error in the hook.
+        """
+        if isinstance(ct, dict):
+            for k in ("mean", "value", "time"):
+                if k in ct:
+                    return float(ct[k])
+            return float(next(iter(ct.values()), 0.0))
+        return float(ct)
+
     def _maybe_reconcile_data_source(self, epoch, steps):
         """Choose an actuator from the descriptor table and reconcile to it.
 
@@ -551,9 +568,14 @@ class DLIOBenchmark(object):
             self.logger.output(f"{utcnow()} data_source action unavailable: {e}")
             return
 
-        epoch_seconds = float(self.stats.get_epoch_seconds(epoch)) if hasattr(
-            self.stats, "get_epoch_seconds") else float(self.args.computation_time * steps)
-        compute_floor = steps * float(self.args.computation_time)
+        # Time the epoch here. StatsCounter has no get_epoch_seconds, and the fallback that used
+        # compute_time * steps would have set epoch_seconds EQUAL to the compute floor, making
+        # stall = 0 and the answer always NONE -- a silent always-decline, which is the worst kind
+        # of bug in a controller because it looks like a considered decision.
+        now = time()
+        epoch_seconds = max(1e-6, now - getattr(self, "_epoch_t0", now))
+        self._epoch_t0 = now
+        compute_floor = steps * self._comp_seconds(self.args.computation_time)
         stall = max(0.0, epoch_seconds - compute_floor)
 
         dst_root = os.environ.get("LIVEFLOW_LOCAL_ROOT", "/l/ssd/izzet/liveflow")
@@ -574,7 +596,7 @@ class DLIOBenchmark(object):
 
         obs = Observation(
             epoch_seconds=epoch_seconds, steps=steps,
-            per_step_compute=float(self.args.computation_time),
+            per_step_compute=self._comp_seconds(self.args.computation_time),
             epochs_remaining=self.epochs - epoch,
             # storage_stall_frac is NOT measurable here (see docstring); pinned at 1.0, and the
             # decode branch is therefore unreachable rather than wrongly reachable.
@@ -760,6 +782,7 @@ class DLIOBenchmark(object):
             for epoch in dft_ai.pipeline.epoch.iter(range(1, self.epochs + 1), include_iter=False):
                 dft_ai.pipeline.epoch.start(metadata=True)
                 self.stats.start_epoch(epoch)
+                self._epoch_t0 = time()   # for the live-actuation hook's epoch_seconds
                 self.next_checkpoint_step = self.steps_between_checkpoints
                 # Create fresh train loader each epoch (subject to @tunable overrides)
                 loader = self.make_loader(
