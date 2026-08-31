@@ -831,6 +831,15 @@ if _HAS_DFOPTIMIZER:
     #                             registered -- it cannot be actuated online at our run lengths.
     _REBUILD_COST = float(os.environ.get("LIVEFLOW_REBUILD_COST", "0.206"))
     _STAGE_COST = float(os.environ.get("LIVEFLOW_STAGE_COST", "465"))
+    # 258.5 GiB at the measured `lfs migrate` rate of 0.012 GB/s. Registered rather than excluded:
+    # whether an action is "offline only" is NOT a property of the action, it is a property of the
+    # action's cost against the run's remaining length.
+    #     3-epoch DLIO   ~25 min   ->  4.4 h is 1000%+ of the run   -> never
+    #     50-epoch       ~7 h      ->  63%                          -> marginal
+    #     LLM, 3 weeks   504 h     ->  0.9%                         -> trivially worth it
+    # The same selection rule rejects it at 25 minutes and accepts it at 3 weeks, with no new logic:
+    # gain * epochs_remaining has to clear the cost, and only the horizon changed.
+    _RESTRIPE_COST = float(os.environ.get("LIVEFLOW_RESTRIPE_COST", "15840"))
 
     _knob_boundary = os.environ.get("DLIO_KNOB_BOUNDARY", "window_boundary")
     _knob_min_threads = int(os.environ.get("DLIO_KNOB_MIN_THREADS", "0"))
@@ -863,8 +872,10 @@ if _HAS_DFOPTIMIZER:
         # Resolvers are registered outside; cost and reversibility belong in the ActionDef the
         # OPTIMIZER reasons over, not here and not in the transport.
         "data_source": knob(
-            default="pfs", type=str, values=["pfs", "local"],
-            cost_seconds=_STAGE_COST,
+            default="pfs", type=str, values=["pfs", "local", "restriped"],
+            # Cost per VALUE. Collapsing these to one number per knob would make "local" look as
+            # expensive as a restripe, or a restripe look as cheap as a stage.
+            cost_seconds={"pfs": 0.0, "local": _STAGE_COST, "restriped": _RESTRIPE_COST},
             responds_to={
                 "storage_starved": {
                     "direction": "set", "set_to": "local",
@@ -872,6 +883,30 @@ if _HAS_DFOPTIMIZER:
                     "apply_when": _knob_boundary,
                 },
             },
+        ),
+        # Decode parallelism. Registered so the row is EXECUTABLE, though no measured decode-bound
+        # regime exists on either branch -- ours failed (computation_threads=1 amplified storage) and
+        # Tuolumne retracted theirs (stall only at dt=1; a starved pool, not a decode-bound
+        # workload). Its effect model is therefore unvalidated, which is why nothing selects it yet.
+        "computation_threads": knob(
+            default=1, range=(1, _knob_max_threads), type=int, cost_seconds=_REBUILD_COST,
+            responds_to={
+                "decode_pressure": {
+                    "direction": "increase", "step_mode": "add", "step": 2,
+                    "min_persistence": 1, "cooldown_windows": 2,
+                    "apply_when": _knob_boundary,
+                },
+            },
+        ),
+        # Read SHAPE, as opposed to read COUNT. AUTOTUNE cannot reach it (tf_reader.py:111 passes
+        # transfer_size straight to TFRecordDataset while the AUTOTUNE block replaces only the three
+        # parallelism args), but measured here it does not matter: +1.5%, p=0.32, n=3 at AUTOTUNE's
+        # own operating point. Registered for completeness; nothing should select it on this
+        # evidence.
+        "transfer_size": knob(
+            default=262144, values=[262144, 1048576, 4194304, 16777216], type=int,
+            cost_seconds=_REBUILD_COST,
+            responds_to={},
         ),
         "read_threads": knob(
             default=max(0, _knob_min_threads), range=(_knob_min_threads, _knob_max_threads), type=int,
