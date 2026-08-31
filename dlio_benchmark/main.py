@@ -465,20 +465,33 @@ class DLIOBenchmark(object):
             prefetch_size = self.args.prefetch_size
         if read_threads is None:
             read_threads = self.args.read_threads
-        # data_source arrives the same way every other knob does -- injected by @tunable from a plan
-        # that came off the SHM mailbox. The RECONCILE lives outside DLIO (liveflow_shm/python), so
-        # the benchmark carries a dispatch, not a policy.
-        if data_source == "local" and getattr(self, "_data_source", "pfs") != "local":
+        # data_source arrives like every other knob -- injected by @tunable from a plan off the SHM
+        # mailbox. What satisfying a value COSTS is not the application's business: resolvers are
+        # registered elsewhere, so adding a data-location actuator ("replica", "compressed",
+        # "cache", ...) touches no code here. A resolver that declines or fails returns None and the
+        # run carries on unchanged -- an actuator must never take down the job it is optimising.
+        if data_source and data_source != getattr(self, "_data_source", "pfs"):
             try:
                 import sys as _sys
                 _sys.path.insert(0, os.environ.get(
                     "LIVEFLOW_PY",
                     "/p/vast1/izzet/worktrees/dfsuite/corona/liveflow_shm/python"))
-                from staging_reconcile import reconcile_data_source
-                if reconcile_data_source(self, epoch):
-                    self._data_source = "local"
+                from data_source import resolve as _resolve
+                _ctx = type("Ctx", (), {
+                    "comm": self.comm, "rank": self.my_rank, "local_rank": self.my_local_rank,
+                    "comm_size": self.comm_size, "framework": self.args.framework,
+                    "steps": getattr(self, "_last_steps", 0),
+                    "per_step_compute": getattr(self, "_last_per_step_compute", 0.0),
+                    "epoch_seconds": getattr(self, "_last_epoch_seconds", 0.0),
+                    "epochs_remaining": max(0, int(self.args.epochs) - int(epoch) + 1),
+                    "log": self.logger.output})()
+                _new = _resolve(data_source, list(self.args.file_list_train), _ctx)
+                if _new:
+                    self.args.file_list_train = _new
+                    self.args.data_folder = os.path.dirname(os.path.dirname(_new[0]))
+                self._data_source = data_source
             except Exception as e:
-                self.logger.output(f"{utcnow()} data_source reconcile unavailable: {e}")
+                self.logger.output(f"{utcnow()} data_source resolve unavailable: {e}")
 
         # Broadcast knob values from local rank 0 so per-node optimizers can
         # tune different nodes independently.
@@ -815,13 +828,15 @@ if _HAS_DFOPTIMIZER:
                 },
             },
         ),
-        # The staging actuator, expressed as a knob on the SAME path as read_threads/prefetch_size.
-        # It rides the existing plan -> SHM mailbox -> reconcile machinery (verified on this branch:
-        # a published plan moved read_threads 1 -> 2 -> 4 with acks returned). Nothing bespoke.
+        # WHERE THE BYTES COME FROM, as a knob on the SAME path as read_threads/prefetch_size. It
+        # rides the existing plan -> SHM mailbox -> reconcile machinery (verified on this branch: a
+        # published plan moved read_threads 1 -> 2 -> 4 with acks returned). Nothing bespoke.
         #
-        # It differs from the others only in what reconciling COSTS: 465-1365 s, collective, and
-        # abortable rather than instantly reversible. That is what ActionDef exists to express; the
-        # transport does not care.
+        # The application does not know what any value MEANS or costs. "local" happens to be
+        # satisfied by staging a shard to node-local NVMe (465-1365 s, collective, abortable), but
+        # "replica", "compressed" and "cache" are the same kind of thing at different prices.
+        # Resolvers are registered outside; cost and reversibility belong in the ActionDef the
+        # OPTIMIZER reasons over, not here and not in the transport.
         "data_source": knob(
             default="pfs", type=str, values=["pfs", "local"],
             responds_to={
