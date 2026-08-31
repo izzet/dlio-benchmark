@@ -618,6 +618,9 @@ class DLIOBenchmark(object):
                            "epochs_remaining": obs.epochs_remaining})(),
             self.comm, mine, dst_dir, all_names,
             os.path.dirname(files[0]) if files else "",
+            # ONE stager per node. The shard is node-level, so every local rank copying it would do
+            # ppn-times the work to the same paths. All ranks still enter every allreduce.
+            do_copy=(self.my_local_rank == 0), rank=self.my_rank,
             log=(self.logger.output if self.my_rank == 0 else (lambda *_: None)))
         if ok:
             # Repointing is enough: the loader is rebuilt at the next epoch boundary, so the new
