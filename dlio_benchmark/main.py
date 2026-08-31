@@ -590,7 +590,17 @@ class DLIOBenchmark(object):
         comm_size, my_rank = self.comm_size, self.my_rank
         ppn = max(1, comm_size // max(1, int(os.environ.get("LIVEFLOW_NODES", "1"))))
         node = my_rank // ppn
-        mine = [f for i, f in enumerate(files) if (i % comm_size) // ppn == node]
+        # Sharding rule is the FRAMEWORK's, not ours. tf_reader shards STRIDED (r::comm_size);
+        # dlio_sampler shards CONTIGUOUSLY ([r*spp, (r+1)*spp)). Using the wrong one does not fail --
+        # the node stages files its ranks never read and reads the rest over symlinks to the PFS, so
+        # the arm silently shows no speedup.
+        import math as _math
+        if str(getattr(self.args, "framework", "")).lower().find("pytorch") >= 0:
+            spp = _math.ceil(len(files) / comm_size)
+            mine = [f for i, f in enumerate(files)
+                    if min(i // (ppn * spp), comm_size // ppn - 1) == node]
+        else:
+            mine = [f for i, f in enumerate(files) if (i % comm_size) // ppn == node]
         shard_bytes = float(sum(os.path.getsize(f) for f in mine)) if mine else 0.0
 
         obs = Observation(
