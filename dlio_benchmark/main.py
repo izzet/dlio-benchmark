@@ -526,7 +526,6 @@ class DLIOBenchmark(object):
 
         return loader
 
-    @dft_ai.pipeline.train
     @staticmethod
     def _comp_seconds(ct):
         """computation_time may be a scalar OR a distribution dict.
@@ -629,6 +628,7 @@ class DLIOBenchmark(object):
         if self.my_rank == 0:
             self.logger.output(f"{utcnow()} ACTION reconcile committed={ok}: {why}")
 
+    @dft_ai.pipeline.train
     def _train(self, epoch, loader):
         """
         Training loop for reading the dataset and performing training computations.
