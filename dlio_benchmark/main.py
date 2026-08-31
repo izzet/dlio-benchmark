@@ -807,6 +807,31 @@ class DLIOBenchmark(object):
 
 # Apply @tunable decorator to make_loader if dfoptimizer is available.
 if _HAS_DFOPTIMIZER:
+    # ---- ACTUATOR COSTS, seconds. Every value here is MEASURED on this machine; none is assumed.
+    #
+    # `cost_seconds` ranks candidates so the planner fires the cheapest that clears its gates. It is
+    # a RANKING input, not the commit decision: the real cost of an expensive action is measured
+    # while it runs, and staging abandons mid-copy if the observed rate contradicts the estimate
+    # (seen in production -- 0.130 GB/s implied 2130 s against an 1089 s horizon, so it paid 265 s
+    # and quit). Ranking needs order; committing needs the live number.
+    #
+    #   loader rebuild   0.206 s  mean of n=3 steady-state epochs, TF path, make_loader -> first
+    #                             step (0.207/0.204/0.209; epoch 1 is 1.023 s and excluded as
+    #                             first-touch). Applies to read_threads, prefetch_size and any other
+    #                             knob whose reconcile is "rebuild the loader".
+    #                             CAVEAT: TENSORFLOW ONLY. The PyTorch path rebuilds by FORKING
+    #                             WORKERS, which is why the loader cache existed at all, and that
+    #                             cost is UNMEASURED. Overriding via LIVEFLOW_REBUILD_COST is the
+    #                             honest stopgap until it is measured.
+    #   staging          465-1365 s over 6 runs of byte-identical work (465/474/477/679/1181/1365).
+    #                             Declared at the LOW end: under-stating an expensive action is the
+    #                             dangerous direction, so the planner faces the most favourable
+    #                             number it could see and must still prefer a 0.2 s knob.
+    #   restripe         ~4.4 h   258.5 GiB at a measured `lfs migrate` rate of 0.012 GB/s. Not
+    #                             registered -- it cannot be actuated online at our run lengths.
+    _REBUILD_COST = float(os.environ.get("LIVEFLOW_REBUILD_COST", "0.206"))
+    _STAGE_COST = float(os.environ.get("LIVEFLOW_STAGE_COST", "465"))
+
     _knob_boundary = os.environ.get("DLIO_KNOB_BOUNDARY", "window_boundary")
     _knob_min_threads = int(os.environ.get("DLIO_KNOB_MIN_THREADS", "0"))
     _knob_max_threads = int(os.environ.get(
@@ -816,7 +841,7 @@ if _HAS_DFOPTIMIZER:
         _knob_min_threads = _knob_max_threads
     DLIOBenchmark.make_loader = tunable(knobs={
         "prefetch_size": knob(
-            default=2, range=(1, 16), type=int,
+            default=2, range=(1, 16), type=int, cost_seconds=_REBUILD_COST,
             responds_to={
                 "dataloader_prefetch": {
                     "direction": "increase",
@@ -839,6 +864,7 @@ if _HAS_DFOPTIMIZER:
         # OPTIMIZER reasons over, not here and not in the transport.
         "data_source": knob(
             default="pfs", type=str, values=["pfs", "local"],
+            cost_seconds=_STAGE_COST,
             responds_to={
                 "storage_starved": {
                     "direction": "set", "set_to": "local",
@@ -849,6 +875,7 @@ if _HAS_DFOPTIMIZER:
         ),
         "read_threads": knob(
             default=max(0, _knob_min_threads), range=(_knob_min_threads, _knob_max_threads), type=int,
+            cost_seconds=_REBUILD_COST,
             responds_to={
                 "reader_parallelism": {
                     "direction": "increase",
