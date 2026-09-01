@@ -645,6 +645,12 @@ class DLIOBenchmark(object):
                         epoch=epoch,
                         prefetch_size=self.args.prefetch_size,
                         read_threads=self.args.read_threads,
+                        # @tunable only injects a knob whose parameter is PRESENT in kwargs
+                        # (tunable.py:110); anything else is acked "rejected". data_source was
+                        # declared on make_loader but never passed here, so every data_source plan
+                        # was rejected with knob_not_in_kwargs -- 7 times in one run -- and the
+                        # actuator could never fire however cheap or correct the plan was.
+                        data_source=getattr(self, "_data_source", "pfs"),
                         _apply_at="window_boundary",
                     )
                     if new_loader is not loader:
@@ -732,6 +738,8 @@ class DLIOBenchmark(object):
                     epoch=epoch,
                     prefetch_size=self.args.prefetch_size,
                     read_threads=self.args.read_threads,
+                    # present in kwargs or @tunable cannot inject it; see the window-boundary call
+                    data_source=getattr(self, "_data_source", "pfs"),
                 )
                 self.stats.start_train(epoch)
                 steps = self._train(epoch, loader)
