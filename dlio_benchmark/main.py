@@ -610,7 +610,16 @@ class DLIOBenchmark(object):
                     self._window.stop()
                 break
             self.stats.batch_loaded(epoch, overall_step, block)
-            dft_ai.compute.step.start(metadata=True)
+            # PARENT compute region, named `compute`, per liveflow_shm/ANNOTATION-SPEC.md.
+            #
+            # Was dft_ai.compute.step. The rename is numerically neutral -- same wrapped code, same
+            # span, and Compute.__init__ sets cat=COMPUTE name=COMPUTE -- but it is what makes the
+            # domain time selectable as the PARENT of a hierarchy. A layer definition of
+            # `cat == "compute"` sums every level, so the moment a child region is added under a
+            # broad definition, compute silently reports ~2x. Selecting `func_name == "compute"`
+            # cannot double count at any depth; sub-regions (forward/backward) can then be added
+            # freely as diagnostics, which is what StorMer already does.
+            dft_ai.compute.start(metadata=True)
             try:
                 computation_time = self.args.computation_time
                 if (isinstance(computation_time, dict) and len(computation_time) > 0) or (isinstance(computation_time, float) and  computation_time > 0):
@@ -633,7 +642,7 @@ class DLIOBenchmark(object):
                 else:
                     block_step += 1
             finally:
-                dft_ai.compute.step.stop(metadata=True)
+                dft_ai.compute.stop(metadata=True)
             dft_ai.pipeline.step.stop(metadata=True)
             if self._window is not None:
                 at_boundary = self._window.stop()
