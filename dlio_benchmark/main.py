@@ -470,21 +470,86 @@ class DLIOBenchmark(object):
         # registered elsewhere, so adding a data-location actuator ("replica", "compressed",
         # "cache", ...) touches no code here. A resolver that declines or fails returns None and the
         # run carries on unchanged -- an actuator must never take down the job it is optimising.
-        if data_source and data_source != getattr(self, "_data_source", "pfs"):
+        #
+        # THE AGREEMENT IS COLLECTIVE, IT IS TAKEN OUTSIDE THE CHANGE GUARD, AND IT IS NODE-LOCAL.
+        #
+        # `data_source` is the one knob whose apply contains a collective (capacity veto, chunk
+        # count, abort ballot). The mailbox that carries the plan is reconciling, not
+        # synchronising: desired_actions_for's own docstring says every rank converges on the same
+        # value EVENTUALLY, not at the same instant, and that this "is NOT sufficient for a knob
+        # whose apply contains a collective ... a rank arriving a window late deadlocks the ones
+        # that arrived on time". Every rank reaches this line at every epoch boundary whether or
+        # not it saw a plan, so the decision is made collective too: agree first, then act.
+        #
+        # NODE-LOCAL, and this is not a weakening -- it is the scope the architecture already has.
+        # Measured on the first two-node run: node 1's agent proposed data_source=local and all
+        # eight of its ranks saw it, node 0's agent had not, and a WORLD allreduce(min) therefore
+        # deferred forever. That is structural, not a race. Agents are per node with no channel
+        # between them (that independence is the design, verified at 2 nodes in
+        # STATUS-CORONA-2026-09-01 section 1.6), so a world-unanimous vote can only succeed if two
+        # independent planners happen to decide the same thing in the same epoch.
+        #
+        # And staging IS a per-node action: each node copies its own shard to its own NVMe. The
+        # global file LIST stays identical either way -- a staged node holds real files, an
+        # unstaged node holds the PFS paths, both lists have the same names in the same order, and
+        # tf_reader/dlio_sampler shard by INDEX -- so a node that declines simply reads from the
+        # PFS. Mixed is safe here; what would not be safe is two ranks OF ONE NODE disagreeing,
+        # because they share the destination directory, and that is exactly what this vote covers.
+        #
+        # It also removes a real availability problem: free space on /l/ssd was measured between
+        # 1 GB and 1.7 TB across nodes of this cluster on one day, and under a world veto one full
+        # disk blocked staging everywhere.
+        _want = 1 if (data_source and data_source != getattr(self, "_data_source", "pfs")) else 0
+        _agreed = _want
+        _vote_comm = self.local_comm if self.local_comm is not None else self.comm
+        if _vote_comm is not None:
+            try:
+                # op=min, not MPI.MIN: mpi4py maps the builtin, and main.py deliberately does not
+                # import mpi4py at module scope (fork-safety, sec 57). staging_action.py uses the
+                # same form for its own veto.
+                _agreed = _vote_comm.allreduce(_want, op=min)
+            except Exception as e:                      # noqa: BLE001 - never fail the training run
+                self.logger.output(f"{utcnow()} data_source agreement unavailable: {e}")
+                _agreed = 0
+        if _want and not _agreed:
+            self.logger.output(
+                f"{utcnow()} data_source={data_source} deferred: not every rank sees it yet "
+                f"(reconciling delivery; will re-assert at the next epoch boundary)")
+        if _agreed:
             try:
                 import sys as _sys
                 _sys.path.insert(0, os.environ.get(
                     "LIVEFLOW_PY",
                     "/p/vast1/izzet/worktrees/dfsuite/corona/liveflow_shm/python"))
                 from data_source import resolve as _resolve
+                # node/nnodes/ppn come from MPI, NOT from an environment variable. The resolver used
+                # to read LIVEFLOW_NODES with a default of 1, which no harness sets: ppn then came
+                # out as comm_size, every rank computed node=0, and every node staged node 0's
+                # shard. That is PAPER-SPINE integration bug 4 through a different door, and it does
+                # not fail -- it stages 1/N of the corpus N times and reads the rest over symlinks,
+                # so the arm reports a clean, believable "staging barely helps".
+                # `comm` is the NODE-LOCAL communicator: the resolver's collectives (capacity veto,
+                # chunk-count agreement, abort ballot) are about one node's own copy to its own
+                # disk, and the agreement above was taken on the same communicator. `comm_size`
+                # stays the WORLD size because the shard mapping is a function of global rank
+                # count, not of this node's.
                 _ctx = type("Ctx", (), {
-                    "comm": self.comm, "rank": self.my_rank, "local_rank": self.my_local_rank,
+                    "comm": (self.local_comm if self.local_comm is not None else self.comm),
+                    "rank": self.my_rank, "local_rank": self.my_local_rank,
                     "comm_size": self.comm_size, "framework": self.args.framework,
+                    "node": self.my_node, "nnodes": DLIOMPI.get_instance().nnodes(),
+                    "ppn": DLIOMPI.get_instance().npernode(),
                     "steps": getattr(self, "_last_steps", 0),
                     "per_step_compute": getattr(self, "_last_per_step_compute", 0.0),
                     "epoch_seconds": getattr(self, "_last_epoch_seconds", 0.0),
                     "epochs_remaining": max(0, int(self.args.epochs) - int(epoch) + 1),
                     "log": self.logger.output})()
+                if self.my_rank == 0:
+                    self.logger.output(
+                        f"{utcnow()} data_source -> {data_source}: horizon from epoch "
+                        f"{_ctx.epoch_seconds:.2f}s, {_ctx.steps} steps x "
+                        f"{_ctx.per_step_compute:.5f}s compute, {_ctx.epochs_remaining} epochs "
+                        f"remaining, {_ctx.nnodes} nodes x {_ctx.ppn} ranks")
                 _new = _resolve(data_source, list(self.args.file_list_train), _ctx)
                 if _new:
                     self.args.file_list_train = _new
@@ -859,6 +924,20 @@ if _HAS_DFOPTIMIZER:
     _RESTRIPE_COST = float(os.environ.get("LIVEFLOW_RESTRIPE_COST", "15840"))
 
     _knob_boundary = os.environ.get("DLIO_KNOB_BOUNDARY", "window_boundary")
+    # data_source gets its OWN boundary, and it defaults to the epoch.
+    #
+    # THE BUG THIS FIXES, and it is silent. At window_boundary the first apply lands mid-epoch-1,
+    # where `_last_epoch_seconds`, `_last_steps` and `_last_per_step_compute` are all still 0
+    # because main.py sets them only after `_train` returns. staging_reconcile derives
+    # `gain_per_epoch` from exactly those three, so gain=0, horizon=0, and the abort test
+    # `horizon > cost_projected * 1.2` is false on the FIRST chunk. Every mid-epoch staging plan
+    # aborts having paid for one chunk, and it reports that as a considered abort.
+    #
+    # It is also the wrong semantics. The measured decision (live4) was taken at the END of epoch 1
+    # against a measured epoch: `ACTION epoch=1 stall=401.6s floor=115.0s remaining=3`. A
+    # collective, expensive, semi-irreversible actuator belongs at an epoch boundary; the free
+    # reversible ones stay at window boundaries and are unaffected by this.
+    _data_source_boundary = os.environ.get("DLIO_DATA_SOURCE_BOUNDARY", "epoch_boundary")
     _knob_min_threads = int(os.environ.get("DLIO_KNOB_MIN_THREADS", "0"))
     _knob_max_threads = int(os.environ.get(
         "DLIO_KNOB_MAX_THREADS", str(os.cpu_count() or 8)
@@ -889,7 +968,18 @@ if _HAS_DFOPTIMIZER:
         # Resolvers are registered outside; cost and reversibility belong in the ActionDef the
         # OPTIMIZER reasons over, not here and not in the transport.
         "data_source": knob(
-            default="pfs", type=str, values=["pfs", "local", "restriped"],
+            # VALUES. "restriped" is opt-in (DFOPTIMIZER_REGISTER_RESTRIPED=1) because its resolver
+            # ALWAYS declines -- it is registered and costed but not implemented, and its gain model
+            # is unvalidated at one stream per file (gate v3: 1.40x at 16 streams, flat at 1,
+            # p=0.74). As a declared level it is still an arm the acquisition explores, and being
+            # never satisfied it stays under-sampled forever, so the gate never stops it. Measured
+            # at 2 nodes: it won the epoch boundary twice, declined twice, and consumed the two
+            # chances "local" had to fire in that epoch. Its correct deferral by cost is a replay
+            # result and does not need a live arm to demonstrate.
+            default="pfs", type=str,
+            values=(["pfs", "local", "restriped"]
+                    if os.environ.get("DFOPTIMIZER_REGISTER_RESTRIPED", "0") == "1"
+                    else ["pfs", "local"]),
             # Cost per VALUE. Collapsing these to one number per knob would make "local" look as
             # expensive as a restripe, or a restripe look as cheap as a stage.
             cost_seconds={"pfs": 0.0, "local": _STAGE_COST, "restriped": _RESTRIPE_COST},
@@ -897,15 +987,39 @@ if _HAS_DFOPTIMIZER:
                 "storage_starved": {
                     "direction": "set", "set_to": "local",
                     "min_persistence": 1, "cooldown_windows": 999,
-                    "apply_when": _knob_boundary,
+                    "apply_when": _data_source_boundary,
                 },
             },
         ),
-        # Decode parallelism. Registered so the row is EXECUTABLE, though no measured decode-bound
-        # regime exists on either branch -- ours failed (computation_threads=1 amplified storage) and
-        # Tuolumne retracted theirs (stall only at dt=1; a starved pool, not a decode-bound
-        # workload). Its effect model is therefore unvalidated, which is why nothing selects it yet.
-        "computation_threads": knob(
+        # Decode parallelism, OFF BY DEFAULT. `DFOPTIMIZER_REGISTER_COMPUTATION_THREADS=1` restores it.
+        #
+        # The comment here used to end "its effect model is therefore unvalidated, which is why
+        # nothing selects it yet". Measured on Corona, 2 nodes, cosmoflow: something did select it,
+        # in 44 of 46 windows, and it made the run 50% slower (epoch 1 at the shipped default
+        # 79.95 s; epochs 2 and 3, after the knob had been driven to 1, 119.73 s and 122.94 s).
+        #
+        # The mechanism is domain ownership, not the knob. `_domain_of` has no entry for
+        # `computation_threads`, so it falls to the default domain "compute" -- and on DLIO the
+        # compute domain is a `time.sleep` (framework/torch_framework.py:43 -> utility.py:346;
+        # tf_framework equivalently). `compute_time_proc_max` is therefore large and real (0.00551 s
+        # per step, 11 ms of an 18.7 ms window here) and WINS the cross-layer argmax, but no
+        # actuator anywhere can shorten a sleep. The planner then does the only thing it can with
+        # the domain's sole knob: move it. On the TF path that knob is `num_parallel_calls` on the
+        # decode map (tf_reader.py:103), so "tune compute" actually throttles decode, and driving it
+        # to 1 serialises the map.
+        #
+        # Unregistering makes the compute domain own NO knob, which turns a compute-dominant window
+        # into a DECLINE by exactly the mechanism the `unattributed` pseudo-domain already uses: a
+        # domain that wins the argmax and owns nothing means there is nothing to do. That is the
+        # correct answer for a simulated-compute benchmark, and it is a comparison rather than a
+        # constant. It also stops a knob whose effect model is admittedly unvalidated from being
+        # the most-actuated knob in the run.
+        #
+        # Two things to fix before turning it back on, recorded so this is a deferral and not a
+        # deletion: `computation_threads` belongs in the DECODE domain, not compute, on any
+        # framework where it drives a decode map; and DLIO's compute domain needs to be marked
+        # actuator-less rather than merely knob-less, so the decline is explicit.
+        **({"computation_threads": knob(
             default=1, range=(1, _knob_max_threads), type=int, cost_seconds=_REBUILD_COST,
             responds_to={
                 "decode_pressure": {
@@ -914,17 +1028,30 @@ if _HAS_DFOPTIMIZER:
                     "apply_when": _knob_boundary,
                 },
             },
-        ),
+        )} if os.environ.get("DFOPTIMIZER_REGISTER_COMPUTATION_THREADS", "0") == "1" else {}),
         # Read SHAPE, as opposed to read COUNT. AUTOTUNE cannot reach it (tf_reader.py:111 passes
         # transfer_size straight to TFRecordDataset while the AUTOTUNE block replaces only the three
         # parallelism args), but measured here it does not matter: +1.5%, p=0.32, n=3 at AUTOTUNE's
         # own operating point. Registered for completeness; nothing should select it on this
         # evidence.
-        "transfer_size": knob(
+        # NOT REGISTERED BY DEFAULT. `DFOPTIMIZER_REGISTER_TRANSFER_SIZE=1` restores it.
+        #
+        # It is not a parameter of `make_loader`, so `@tunable` cannot inject it and acks every plan
+        # `knob_not_in_kwargs` (open bug #30, and BASELINE-HARNESS.md section 8 lists it as a static
+        # knob only). Registering an unappliable knob is not harmless: a never-applied arm never
+        # accumulates samples, so the acceptance gate treats it as under-sampled and lets it through
+        # every window, and the cheapest-first escalation stops there. Measured on Corona at 2 nodes:
+        # 144,048 rejected transfer_size plans and 0 applied ones in a single epoch, while
+        # `data_source` -- ordered immediately behind it -- was never reached.
+        #
+        # The planner now also retires a knob after repeated refusals, so this would self-correct;
+        # it is unregistered as well because the honest registry is the one that lists what the
+        # application can actually do.
+        **({"transfer_size": knob(
             default=262144, values=[262144, 1048576, 4194304, 16777216], type=int,
             cost_seconds=_REBUILD_COST,
             responds_to={},
-        ),
+        )} if os.environ.get("DFOPTIMIZER_REGISTER_TRANSFER_SIZE", "0") == "1" else {}),
         "read_threads": knob(
             default=max(0, _knob_min_threads), range=(_knob_min_threads, _knob_max_threads), type=int,
             cost_seconds=_REBUILD_COST,
