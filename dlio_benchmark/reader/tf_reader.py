@@ -16,6 +16,7 @@
 """
 import math
 import os
+import sys
 
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 from dlio_benchmark.utils.utility import utcnow, Profile, maybe_inject_fetch_delay
@@ -101,6 +102,23 @@ class TFReader(FormatReader):
         _num_parallel_reads = tf.data.AUTOTUNE if _autotune else read_threads
         _num_parallel_calls = tf.data.AUTOTUNE if _autotune else self._args.computation_threads
         _prefetch_buffer = tf.data.AUTOTUNE if _autotune else prefetch_size
+        # SAY WHICH ARM RAN, IN THE RUN'S OWN LOG. An AUTOTUNE arm and a shipped-default arm are
+        # otherwise indistinguishable in every log the harness writes: AUTOTUNE overrides these
+        # three values HERE and nothing upstream knows, so the header still reports the yaml's
+        # read_threads and prefetch_size. A missing or mistyped DLIO_TF_AUTOTUNE therefore yields a
+        # complete, believable run that is silently the shipped default wearing the baseline's
+        # name. Written to stderr rather than through DLIOLogger because the logger's level and
+        # handlers are configured per rank and per run, and a suppressed line would recreate the
+        # very ambiguity this one exists to remove.
+        if self._args.my_rank == 0:
+            print("[TF_READER] autotune=%d num_parallel_reads=%s num_parallel_calls=%s "
+                  "prefetch=%s transfer_size=%s"
+                  % (int(_autotune),
+                     "AUTOTUNE" if _autotune else read_threads,
+                     "AUTOTUNE" if _autotune else self._args.computation_threads,
+                     "AUTOTUNE" if _autotune else prefetch_size,
+                     self._args.transfer_size),
+                  file=sys.stderr, flush=True)
 
         filenames = tf.data.Dataset.list_files(self._file_list, shuffle=False)
         # sharding in the file list if we have enought files.
