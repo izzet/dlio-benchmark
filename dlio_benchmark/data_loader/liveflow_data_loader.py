@@ -360,7 +360,9 @@ class LiveFlowDataLoader(BaseDataLoader):
         # compared against one that does not, and this file is in the observation path.
         src = self._prefetch if self._prefetch is not None else self._dataset
         step = 1
-        it = iter(dft_ai.dataloader.fetch.iter(src))
+        fetch = dft_ai.dataloader.fetch
+        consumer_body = fetch.derive("block")
+        it = iter(fetch.iter(src, include_block=False))
         while True:
             t0 = time.monotonic()
             try:
@@ -376,7 +378,11 @@ class LiveFlowDataLoader(BaseDataLoader):
             dlp.update(step=step)
             dft_ai.update(step=step)
             step += 1
-            yield batch
+            consumer_body.start()
+            try:
+                yield batch
+            finally:
+                consumer_body.stop()
         self.epoch_number += 1
         dlp.update(epoch=self.epoch_number)
         dft_ai.update(epoch=self.epoch_number)

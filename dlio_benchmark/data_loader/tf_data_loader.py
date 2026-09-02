@@ -20,6 +20,7 @@ import tensorflow as tf
 from dlio_benchmark.common.constants import MODULE_DATA_LOADER
 from dlio_benchmark.common.enumerations import DataLoaderType, FormatType, DatasetType
 from dlio_benchmark.data_loader.base_data_loader import BaseDataLoader
+from dlio_benchmark.data_loader.consumer_iterator import traced_consumer_batches
 from dlio_benchmark.reader.reader_factory import ReaderFactory
 from dlio_benchmark.utils.utility import utcnow, Profile, DLIOLogger, dft_ai
 
@@ -102,7 +103,7 @@ class TFDataLoader(BaseDataLoader):
     def next(self):
         super().next()
         step = 1
-        for batch in dft_ai.dataloader.fetch.iter(self._dataset):
+        for batch in traced_consumer_batches(self._dataset):
             dlp.update(step=step)
             dft_ai.update(step=step)
             step += 1
