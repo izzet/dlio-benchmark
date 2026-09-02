@@ -449,6 +449,47 @@ class DLIOBenchmark(object):
         if self.comm.rank == 0:
             self.logger.output(f"{utcnow()} Checkpointing write started")
 
+    def _horizon_terms(self, epoch):
+        """The terms an expensive actuator is judged against: steps, per-step compute, the epoch
+        it should expect, and how many epochs are left after this one.
+
+        WHY THIS IS NOT JUST `self._last_*`. Those three are set after `_train` returns, so at a
+        WINDOW boundary they describe the PREVIOUS epoch or, in epoch 1, nothing at all -- and a
+        zero epoch time gives gain 0, horizon 0, and an abort on the first chunk. That is why
+        `data_source` was pinned to epoch boundaries. The pin then cost the 32-node run its result:
+        the decision was ready 60 s after the epoch 1 boundary, waited for the epoch 2 boundary, and
+        ran with a single epoch of horizon against an 884 s copy.
+
+        Mid-epoch the same quantities are measurable rather than absent. Elapsed time and completed
+        steps are both known, so the epoch this run is heading for is a projection from its own
+        progress, not an estimate borrowed from elsewhere, and the remaining horizon includes the
+        part of THIS epoch still to come. Before any step has completed there is still nothing to
+        project from, and then the terms stay zero and an expensive action is declined, which is the
+        same conservative answer as before.
+        """
+        steps_total = int(getattr(self, "_steps_per_epoch", 0) or 0)
+        done = int(getattr(self, "_steps_done_this_epoch", 0) or 0)
+        per_step = self._comp_seconds(self.args.computation_time)
+        # Epochs strictly AFTER this one. `epoch` is one based.
+        after = max(0, int(self.args.epochs) - int(epoch))
+
+        if done > 0 and steps_total > 0:
+            elapsed = max(1e-6, time() - getattr(self, "_epoch_t0", time()))
+            frac_done = min(1.0, done / float(steps_total))
+            projected = elapsed / max(frac_done, 1e-6)
+            # The rest of this epoch counts toward the payback too: staging now shortens the
+            # remainder of the epoch it interrupts, not only the ones after it.
+            remaining = after + (1.0 - frac_done)
+            return {"steps": steps_total, "per_step_compute": per_step,
+                    "epoch_seconds": projected, "epochs_remaining": remaining}
+
+        # Epoch boundary, or a window boundary before the first step completed: fall back to the
+        # epoch that actually finished, which is exact when it exists.
+        return {"steps": getattr(self, "_last_steps", 0),
+                "per_step_compute": getattr(self, "_last_per_step_compute", per_step),
+                "epoch_seconds": getattr(self, "_last_epoch_seconds", 0.0),
+                "epochs_remaining": after + 1}
+
     def make_loader(self, epoch, prefetch_size=None, read_threads=None, data_source=None):
         """Create or reuse a training DataLoader for the given epoch.
 
@@ -539,10 +580,7 @@ class DLIOBenchmark(object):
                     "comm_size": self.comm_size, "framework": self.args.framework,
                     "node": self.my_node, "nnodes": DLIOMPI.get_instance().nnodes(),
                     "ppn": DLIOMPI.get_instance().npernode(),
-                    "steps": getattr(self, "_last_steps", 0),
-                    "per_step_compute": getattr(self, "_last_per_step_compute", 0.0),
-                    "epoch_seconds": getattr(self, "_last_epoch_seconds", 0.0),
-                    "epochs_remaining": max(0, int(self.args.epochs) - int(epoch) + 1),
+                    **self._horizon_terms(epoch),
                     "log": self.logger.output})()
                 if self.my_rank == 0:
                     self.logger.output(
@@ -709,6 +747,13 @@ class DLIOBenchmark(object):
             finally:
                 dft_ai.compute.stop(metadata=True)
             dft_ai.pipeline.step.stop(metadata=True)
+            # LIVE EPOCH PROGRESS, so a horizon can be priced mid-epoch instead of only after the
+            # epoch has finished. See section 4e of liveflow_shm/T3-0-SHM-LOOP-CORONA.md: at 32
+            # nodes the cost-ranked staging decision was ready 60 s AFTER the epoch 1 boundary, so
+            # under an epoch-boundary-only rule it waited for the epoch 2 boundary and ran with one
+            # epoch of horizon, which correctly aborted. Nothing was wrong with the decision or the
+            # abort; the actuator was simply offered the wrong moment.
+            self._steps_done_this_epoch = overall_step
             if self._window is not None:
                 at_boundary = self._window.stop()
                 # Mid-epoch plan application: at window boundaries, check if
@@ -788,6 +833,8 @@ class DLIOBenchmark(object):
             _steps_per_epoch = math.floor(
                 self.num_samples * self.num_files_train / self.batch_size / self.comm_size
             )
+            # Kept on the object so a mid-epoch horizon can be projected from progress.
+            self._steps_per_epoch = _steps_per_epoch
             _default_every_n = max(1, _steps_per_epoch // 5)
             _initial_every_n = int(os.environ.get(
                 "DLIO_WINDOW_EVERY_N", _default_every_n
@@ -819,6 +866,7 @@ class DLIOBenchmark(object):
                 if self._window is not None:
                     self._window.set_epoch(epoch)
                 self._epoch_t0 = time()   # for the live-actuation hook's epoch_seconds
+                self._steps_done_this_epoch = 0
                 self.next_checkpoint_step = self.steps_between_checkpoints
                 # Create fresh train loader each epoch (subject to @tunable overrides)
                 loader = self.make_loader(
@@ -950,7 +998,15 @@ if _HAS_DFOPTIMIZER:
     # against a measured epoch: `ACTION epoch=1 stall=401.6s floor=115.0s remaining=3`. A
     # collective, expensive, semi-irreversible actuator belongs at an epoch boundary; the free
     # reversible ones stay at window boundaries and are unaffected by this.
-    _data_source_boundary = os.environ.get("DLIO_DATA_SOURCE_BOUNDARY", "epoch_boundary")
+    # Default flipped to the window boundary now that a mid-epoch horizon is measurable
+    # (`_horizon_terms`). The original reason for pinning to the epoch was that mid-epoch the
+    # horizon terms were all zero, so every mid-epoch stage aborted on its first chunk. That is no
+    # longer true: elapsed time and completed steps give a projected epoch, and the horizon
+    # contract gives the epochs after it. The pin cost the 32-node run its result -- the decision
+    # was ready 60 s after the epoch 1 boundary and had to wait for the epoch 2 boundary, leaving
+    # one epoch to repay an 884 s copy, which it correctly refused to do.
+    # DLIO_DATA_SOURCE_BOUNDARY=epoch_boundary restores the old behaviour.
+    _data_source_boundary = os.environ.get("DLIO_DATA_SOURCE_BOUNDARY", "window_boundary")
     _knob_min_threads = int(os.environ.get("DLIO_KNOB_MIN_THREADS", "0"))
     _knob_max_threads = int(os.environ.get(
         "DLIO_KNOB_MAX_THREADS", str(os.cpu_count() or 8)
