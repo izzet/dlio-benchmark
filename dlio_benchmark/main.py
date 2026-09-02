@@ -793,9 +793,17 @@ class DLIOBenchmark(object):
                 "DLIO_WINDOW_EVERY_N", _default_every_n
             ))
             if _HAS_DFOPTIMIZER and dftracer:
+                # epochs_total and steps_per_epoch are the two facts only the application knows,
+                # and they are what the horizon contract (liveflow_shm/HORIZON-CONTRACT.md) needs:
+                # the window carries them onto every boundary event so the analyzer can publish
+                # epochs_remaining and windows_remaining, and a cost-aware planner can price a
+                # 465 s stage against the run that is actually left instead of declining because
+                # it cannot see how much run there is.
                 self._window = Window(
                     dftracer.get_instance(),
                     max_every_n=_steps_per_epoch,
+                    epochs_total=self.epochs,
+                    steps_per_epoch=_steps_per_epoch,
                 )
                 self._window.update_cadence(_initial_every_n)
             else:
@@ -805,6 +813,11 @@ class DLIOBenchmark(object):
             for epoch in dft_ai.pipeline.epoch.iter(range(1, self.epochs + 1), include_iter=False):
                 dft_ai.pipeline.epoch.start(metadata=True)
                 self.stats.start_epoch(epoch)
+                # Horizon contract: the window stamps epoch_index on every boundary event from
+                # here on. Set BEFORE make_loader, so the boundary that carries a staging decision
+                # already knows which epoch it is in.
+                if self._window is not None:
+                    self._window.set_epoch(epoch)
                 self._epoch_t0 = time()   # for the live-actuation hook's epoch_seconds
                 self.next_checkpoint_step = self.steps_between_checkpoints
                 # Create fresh train loader each epoch (subject to @tunable overrides)
