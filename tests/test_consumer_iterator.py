@@ -39,23 +39,13 @@ class _Fetch:
     def __init__(self, clock, events):
         self.clock = clock
         self.events = events
-        self.block = _Region(clock, events, "fetch.block")
+        self.regions = {
+            "iter": _Region(clock, events, "fetch.iter"),
+            "block": _Region(clock, events, "fetch.block"),
+        }
 
     def derive(self, name):
-        assert name == "block"
-        return self.block
-
-    def iter(self, source, include_block=True):
-        assert include_block is False
-        source = iter(source)
-        while True:
-            start = self.clock.now
-            try:
-                batch = next(source)
-            except StopIteration:
-                return
-            self.events.append(("fetch.iter", start, self.clock.now))
-            yield batch
+        return self.regions[name]
 
 
 def test_consumer_regions_are_sibling_next_and_body_events(monkeypatch):
@@ -67,13 +57,17 @@ def test_consumer_regions_are_sibling_next_and_body_events(monkeypatch):
     })()
     monkeypatch.setattr(consumer_iterator, "dft_ai", fake_ai)
 
-    batches = consumer_iterator.traced_consumer_batches(_Source(clock, [5, 3]))
-    assert next(batches) == 5
-    clock.now += 7
-    assert next(batches) == 3
-    clock.now += 11
+    boundary = consumer_iterator.ConsumerBoundary(
+        _Source(clock, [5, 3]), clock=lambda: clock.now
+    )
+    assert boundary.next_batch() == 5
+    with boundary.consumer_body():
+        clock.now += 7
+    assert boundary.next_batch() == 3
+    with boundary.consumer_body():
+        clock.now += 11
     try:
-        next(batches)
+        boundary.next_batch()
     except StopIteration:
         pass
 
@@ -82,4 +76,52 @@ def test_consumer_regions_are_sibling_next_and_body_events(monkeypatch):
         ("fetch.block", 5, 12),
         ("fetch.iter", 12, 15),
         ("fetch.block", 15, 26),
+        # The exhausted source call is traced but is not charged as a batch stall.
+        ("fetch.iter", 26, 26),
     ]
+    assert boundary.totals == (8, 2)
+
+
+class _Tracer:
+    def __init__(self):
+        self.events = []
+
+    def get_time(self):
+        return 1_000_000
+
+    def log_event(self, **event):
+        self.events.append(event)
+
+
+class _TracerFactory:
+    tracer = _Tracer()
+
+    @classmethod
+    def get_instance(cls):
+        return cls.tracer
+
+
+def test_window_stall_is_one_accumulated_main_thread_event(monkeypatch):
+    clock = _Clock()
+    fetch = _Fetch(clock, [])
+    fake_ai = type("AI", (), {
+        "dataloader": type("DataLoader", (), {"fetch": fetch})(),
+    })()
+    monkeypatch.setattr(consumer_iterator, "dft_ai", fake_ai)
+    boundary = consumer_iterator.ConsumerBoundary(
+        _Source(clock, [0.004, 0.006]), clock=lambda: clock.now
+    )
+    boundary.next_batch()
+    boundary.next_batch()
+
+    _TracerFactory.tracer = _Tracer()
+    emitted = boundary.emit_window_stall(2, 8, tracer_factory=_TracerFactory)
+
+    assert emitted == 0.01
+    assert boundary.pending_stall_seconds == 0.0
+    assert len(_TracerFactory.tracer.events) == 1
+    event = _TracerFactory.tracer.events[0]
+    assert (event["cat"], event["name"], event["duration"]) == (
+        "stall", "stall.storage", 10_000
+    )
+    assert event["int_args"] == {"epoch": (0, 2), "step": (0, 8)}

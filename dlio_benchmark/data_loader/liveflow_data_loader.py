@@ -53,6 +53,7 @@ from torch.utils.data import DataLoader
 from dlio_benchmark.common.constants import MODULE_DATA_LOADER
 from dlio_benchmark.common.enumerations import DatasetType, DataLoaderType
 from dlio_benchmark.data_loader.base_data_loader import BaseDataLoader
+from dlio_benchmark.data_loader.consumer_iterator import traced_consumer_batches
 from dlio_benchmark.data_loader.torch_data_loader import TorchDataset, dlio_sampler
 from dlio_benchmark.utils.utility import utcnow, Profile, dft_ai
 
@@ -137,6 +138,7 @@ class LiveFlowDataLoader(BaseDataLoader):
         self._stall_s = 0.0
         self._steps = 0
         self._stall_mark = (0.0, 0)   # last reported (stall_s, steps), for per-window deltas
+        self._consumer_boundary = None
 
     @dlp.log
     def read(self, read_threads=None, prefetch_size=None):
@@ -360,32 +362,23 @@ class LiveFlowDataLoader(BaseDataLoader):
         # compared against one that does not, and this file is in the observation path.
         src = self._prefetch if self._prefetch is not None else self._dataset
         step = 1
-        fetch = dft_ai.dataloader.fetch
-        consumer_body = fetch.derive("block")
-        it = iter(fetch.iter(src, include_block=False))
-        while True:
-            t0 = time.monotonic()
-            try:
-                batch = next(it)
-            except StopIteration:
-                break
-            # Only the blocking wait is counted. Everything between two yields is the training
-            # loop's own compute and belongs to nobody else. This measures the same quantity
-            # `fetch.iter` does, independently -- kept as a cross-check and because a per-window
-            # stall delta is needed locally, where the analyzer's per-epoch aggregate is not.
-            self._stall_s += time.monotonic() - t0
-            self._steps += 1
+        for batch in traced_consumer_batches(src, owner=self):
             dlp.update(step=step)
             dft_ai.update(step=step)
             step += 1
-            consumer_body.start()
-            try:
-                yield batch
-            finally:
-                consumer_body.stop()
+            yield batch
+        if self._consumer_boundary is not None:
+            self._stall_s, self._steps = self._consumer_boundary.totals
         self.epoch_number += 1
         dlp.update(epoch=self.epoch_number)
         dft_ai.update(epoch=self.epoch_number)
+
+    def emit_window_stall(self, epoch, step):
+        if self._consumer_boundary is None:
+            return 0.0
+        emitted = self._consumer_boundary.emit_window_stall(epoch, step)
+        self._stall_s, self._steps = self._consumer_boundary.totals
+        return emitted
 
     @dlp.log
     def finalize(self):
@@ -398,6 +391,8 @@ class LiveFlowDataLoader(BaseDataLoader):
         # The stall fraction is the number sec 83.1 says the attribution rule is missing. Reported
         # unconditionally, including when it is ~0, because "fetch is fully hidden" is exactly the
         # case the rule currently cannot see and acts on anyway.
+        if self._consumer_boundary is not None:
+            self._stall_s, self._steps = self._consumer_boundary.totals
         if self._steps:
             _mark("STALL total=%.3fs steps=%d mean=%.1fms  (consumer blocked waiting for a batch; "
                   "this is the part of fetch that is ON the critical path)"

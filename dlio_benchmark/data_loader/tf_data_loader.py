@@ -60,6 +60,7 @@ class TFDataLoader(BaseDataLoader):
     def __init__(self, format_type, dataset_type, epoch):
         super().__init__(format_type, dataset_type, epoch, DataLoaderType.TENSORFLOW)
         self._dataset = None
+        self._consumer_boundary = None
 
     @dlp.log
     def read(self, read_threads=None, prefetch_size=None):
@@ -103,7 +104,7 @@ class TFDataLoader(BaseDataLoader):
     def next(self):
         super().next()
         step = 1
-        for batch in traced_consumer_batches(self._dataset):
+        for batch in traced_consumer_batches(self._dataset, owner=self):
             dlp.update(step=step)
             dft_ai.update(step=step)
             step += 1
@@ -111,6 +112,11 @@ class TFDataLoader(BaseDataLoader):
         self.epoch_number += 1
         dlp.update(epoch=self.epoch_number)
         dft_ai.update(epoch=self.epoch_number)
+
+    def emit_window_stall(self, epoch, step):
+        if self._consumer_boundary is None:
+            return 0.0
+        return self._consumer_boundary.emit_window_stall(epoch, step)
 
     @dlp.log
     def finalize(self):

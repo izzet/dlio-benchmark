@@ -673,6 +673,21 @@ class DLIOBenchmark(object):
             return float(next(iter(ct.values()), 0.0))
         return float(ct)
 
+    def _window_will_close(self):
+        """Whether this step's stop call will publish the active window."""
+        window = self._window
+        if window is None or not getattr(window, "_active", False):
+            return False
+        return window.every_n <= 1 or window.counter % window.every_n == 0
+
+    @staticmethod
+    def _emit_loader_stall(loader, epoch, step):
+        """Drain the loader account before window.stop reaches the analyzer."""
+        emit = getattr(loader, "emit_window_stall", None)
+        if callable(emit):
+            return emit(epoch, step)
+        return 0.0
+
 
     @dft_ai.pipeline.train
     def _train(self, epoch, loader):
@@ -700,6 +715,8 @@ class DLIOBenchmark(object):
             except StopIteration:
                 dft_ai.pipeline.step.stop(metadata=True)
                 if self._window is not None:
+                    if self._window_will_close():
+                        self._emit_loader_stall(loader, epoch, overall_step)
                     self._window.stop()
                 break
             # Check if max steps reached to prevent incomplete fetch/compute pairs
@@ -710,6 +727,8 @@ class DLIOBenchmark(object):
                     self.stats.end_block(epoch, block, block_step - 1)
                 dft_ai.pipeline.step.stop(metadata=True)
                 if self._window is not None:
+                    if self._window_will_close():
+                        self._emit_loader_stall(loader, epoch, overall_step)
                     self._window.stop()
                 break
             self.stats.batch_loaded(epoch, overall_step, block)
@@ -755,6 +774,11 @@ class DLIOBenchmark(object):
             # abort; the actuator was simply offered the wrong moment.
             self._steps_done_this_epoch = overall_step
             if self._window is not None:
+                # The accumulated event must be ordered before window.stop in the ring. The
+                # analyzer drains on window.stop, so emitting it afterwards silently assigns the
+                # storage wait to the next window or loses the final one at epoch end.
+                if self._window_will_close():
+                    self._emit_loader_stall(loader, epoch, overall_step)
                 at_boundary = self._window.stop()
                 # Mid-epoch plan application: at window boundaries, check if
                 # the optimizer has published new knobs. If so, rebuild the
@@ -887,6 +911,7 @@ class DLIOBenchmark(object):
                 # Force window boundary at epoch end so analyzer processes
                 # any accumulated events before the next epoch begins.
                 if self._window is not None:
+                    self._emit_loader_stall(loader, epoch, steps)
                     self._window.flush()
                 self.logger.debug(f"{utcnow()} Rank {self.my_rank} returned after {steps} steps.")
                 loader.finalize()
