@@ -640,6 +640,14 @@ class DLIOBenchmark(object):
                 )
             loader = self._cached_loader
         else:
+            # A persistent PyTorch DataLoader keeps its worker processes after an epoch.  Do not
+            # fork this epoch's pool until the previous one has exited.  With the LiveFlow gate a
+            # rank's pool is deliberately wide, so overlapping pools transiently doubled the
+            # worker count and fork-inherited tracer/gate state at every epoch boundary.
+            previous = self._cached_loader
+            retire = getattr(previous, "shutdown_workers", None)
+            if callable(retire):
+                retire("epoch %s -> %s" % (self._cached_epoch, epoch))
             if self.my_rank == 0:
                 self.logger.output(
                     f"{utcnow()} make_loader: epoch={epoch} prefetch={prefetch_size}"

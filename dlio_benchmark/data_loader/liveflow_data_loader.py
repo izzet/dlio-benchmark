@@ -275,8 +275,7 @@ class LiveFlowDataLoader(BaseDataLoader):
             _mark("RECONFIGURE gate -> %d exceeds the %d forked workers; regrowing the pool "
                   "(a wider limit cannot be delivered by a narrower pool)" % (want, built))
             self._pool_width = None          # None means "build at MAX"
-            self._dataset = None
-            self._built_workers = None
+            self.shutdown_workers("regrow pool")
             self.read(read_threads=read_threads, prefetch_size=prefetch_size)
             return
 
@@ -287,8 +286,7 @@ class LiveFlowDataLoader(BaseDataLoader):
             # Build at exactly the requested width, so worker count equals concurrency and no
             # worker is ever parked. A later move up regrows the pool via the branch above.
             self._pool_width = want
-            self._dataset = None
-            self._built_workers = None
+            self.shutdown_workers("shrink pool")
             self.read(read_threads=read_threads, prefetch_size=prefetch_size)
             return
 
@@ -320,8 +318,7 @@ class LiveFlowDataLoader(BaseDataLoader):
             elif os.environ.get("LIVEFLOW_GATE_REBUILD_PREFETCH", "0") == "1":
                 _mark("PREFETCH %s -> %s requires a rebuild (opted in); rebuilding"
                       % (self._built_prefetch, prefetch_size))
-                self._dataset = None
-                self._built_workers = None
+                self.shutdown_workers("prefetch rebuild")
                 self.read(read_threads=read_threads, prefetch_size=prefetch_size)
             else:
                 _mark("PREFETCH %s -> %s NOT APPLIED: prefetch_factor is a torch constructor "
@@ -379,6 +376,30 @@ class LiveFlowDataLoader(BaseDataLoader):
         emitted = self._consumer_boundary.emit_window_stall(epoch, step)
         self._stall_s, self._steps = self._consumer_boundary.totals
         return emitted
+
+    def shutdown_workers(self, reason=""):
+        """Stop this pool before another DataLoader forks a replacement.
+
+        Persistent workers intentionally survive ordinary iterator exhaustion.  That is useful
+        while a loader is cached inside one epoch, but it is unsafe to fork a fresh pool while
+        the previous one is still alive: each rank temporarily doubles its worker count and every
+        child retains the parent's fork-inherited tracing and gate state.  PyTorch's private
+        shutdown hook is the supported lifecycle used by its DataLoader destructor; call it
+        explicitly here so the old pool has exited before a replacement is constructed.
+        """
+        dataset = self._dataset
+        iterator = getattr(dataset, "_iterator", None) if dataset is not None else None
+        if iterator is not None:
+            _mark("RETIRE workers=%s reason=%s (shutdown before rebuild)"
+                  % (getattr(dataset, "num_workers", "?"), reason or "unspecified"))
+            try:
+                iterator._shutdown_workers()
+            except Exception as exc:  # a failed worker must not prevent rank teardown
+                _mark("RETIRE workers shutdown failed: %s" % exc)
+        self._dataset = None
+        self._built_workers = None
+        self._built_prefetch = None
+        self._prefetch = None
 
     @dlp.log
     def finalize(self):
