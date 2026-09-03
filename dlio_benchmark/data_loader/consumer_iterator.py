@@ -72,10 +72,10 @@ class ConsumerBoundary:
     def emit_window_stall(self, epoch, step, tracer_factory=PerfTracer):
         """Emit one accumulated main-thread storage-stall event for this window."""
         stalled = self.drain_stall_seconds()
-        if stalled <= 0.0:
-            return 0.0
         tracer = tracer_factory.get_instance()
-        duration_us = max(1, int(round(stalled * 1_000_000.0)))
+        # Zero is a measurement too. Omitting this event makes an empty epoch-boundary window
+        # indistinguishable from an uninstrumented workload and forces the planner fallback.
+        duration_us = max(0, int(round(stalled * 1_000_000.0)))
         now = tracer.get_time()
         tracer.log_event(
             name="stall.storage",

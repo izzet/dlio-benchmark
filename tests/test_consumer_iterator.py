@@ -125,3 +125,22 @@ def test_window_stall_is_one_accumulated_main_thread_event(monkeypatch):
         "stall", "stall.storage", 10_000
     )
     assert event["int_args"] == {"epoch": (0, 2), "step": (0, 8)}
+
+
+def test_zero_window_stall_is_emitted_as_present_zero(monkeypatch):
+    clock = _Clock()
+    fetch = _Fetch(clock, [])
+    fake_ai = type("AI", (), {
+        "dataloader": type("DataLoader", (), {"fetch": fetch})(),
+    })()
+    monkeypatch.setattr(consumer_iterator, "dft_ai", fake_ai)
+    boundary = consumer_iterator.ConsumerBoundary([], clock=lambda: clock.now)
+
+    _TracerFactory.tracer = _Tracer()
+    assert boundary.emit_window_stall(3, 9, tracer_factory=_TracerFactory) == 0.0
+
+    assert len(_TracerFactory.tracer.events) == 1
+    event = _TracerFactory.tracer.events[0]
+    assert (event["cat"], event["name"], event["duration"]) == (
+        "stall", "stall.storage", 0
+    )

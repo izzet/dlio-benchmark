@@ -905,13 +905,31 @@ class DLIOBenchmark(object):
                 self.stats.end_train(epoch, steps)
                 # Record what the reconcile will need if a plan arrives. No policy here: the decision
                 # is the optimizer's and reaches us as a `data_source` knob value off the mailbox.
+                # T1.2 lead B: the DIRECT account of the consumer boundary, measured with a
+                # monotonic clock around exactly `next(source_iterator)` and independent of every
+                # trace region. Printed per epoch on rank 0 so the trace's fetch.iter sum can be
+                # compared against it for the same rank: if they disagree, the region is not where
+                # the wait is, and no amount of analyzer work will find the storage time.
+                try:
+                    _cb = getattr(loader, "_consumer_boundary", None)
+                    if _cb is not None and self.my_rank == 0:
+                        _stall_s, _stall_steps = _cb.totals
+                        _ep_s = max(1e-9, time() - getattr(self, "_epoch_t0", time()))
+                        self.logger.output(
+                            f"{utcnow()} FETCH_DIRECT epoch={epoch} rank=0 "
+                            f"next_wait_sum_s={_stall_s:.3f} steps={_stall_steps} "
+                            f"per_step_ms={1000.0 * _stall_s / max(1, _stall_steps):.3f} "
+                            f"epoch_s={_ep_s:.3f} frac_of_epoch={_stall_s / _ep_s:.3f}")
+                except Exception as _e:                    # noqa: BLE001 - never fail the run
+                    self.logger.output(f"{utcnow()} FETCH_DIRECT unavailable: {_e}")
                 self._last_steps = steps
                 self._last_per_step_compute = self._comp_seconds(self.args.computation_time)
                 self._last_epoch_seconds = max(1e-6, time() - getattr(self, "_epoch_t0", time()))
                 # Force window boundary at epoch end so analyzer processes
                 # any accumulated events before the next epoch begins.
                 if self._window is not None:
-                    self._emit_loader_stall(loader, epoch, steps)
+                    if getattr(self._window, "_active", False):
+                        self._emit_loader_stall(loader, epoch, steps)
                     self._window.flush()
                 self.logger.debug(f"{utcnow()} Rank {self.my_rank} returned after {steps} steps.")
                 loader.finalize()
