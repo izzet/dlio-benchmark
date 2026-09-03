@@ -830,7 +830,16 @@ class DLIOBenchmark(object):
             # broad definition, compute silently reports ~2x. Selecting `func_name == "compute"`
             # cannot double count at any depth; sub-regions (forward/backward) can then be added
             # freely as diagnostics, which is what StorMer already does.
-            dft_ai.compute.start(metadata=True)
+            # DURATIONAL, not metadata. The analyzer's domain split assumes the compute region is
+            # the PARENT that contains communication: metrics.py computes
+            # `compute_time = compute_total - comm` (tests/test_metrics.py says so in as many
+            # words). Until 2026-09-03 the only durational region named `compute` was
+            # TFFramework.compute, i.e. the sleep alone, which does NOT contain the barrier below,
+            # so booking the barrier under comm would have subtracted it from the sleep and driven
+            # the compute domain to 0. Emitting the parent here restores the hierarchy the analyzer
+            # documents. The frameworks' own region is now the child `compute.step`, so exactly one
+            # region is named `compute` and the preset's narrow definition cannot double count.
+            dft_ai.compute.start()
             direct.mark("compute_annot_start")
             try:
                 computation_time = self.args.computation_time
@@ -846,7 +855,21 @@ class DLIOBenchmark(object):
                 self.stats.batch_processed(epoch, overall_step, block)
                 direct.mark("stats_batch_processed")
                 # This is the barrier to simulate allreduce. It is required to simulate the actual workloads.
-                self.comm.barrier()
+                #
+                # ANNOTATED, because at scale it is the largest term in the step and it used to
+                # belong to no domain. Section 4k of liveflow_shm/T3-0-SHM-LOOP-CORONA.md measured
+                # 29.671 ms here against a 40.143 ms step at 32 nodes, 73.9% of the step, and the
+                # analyzer reported it as `unattributed` (comm was 0.000 s in every window) because
+                # nothing emitted a comm region. Rank 0 is not waiting on its own storage; it is
+                # waiting for whichever of the other 255 ranks is, so this is where a
+                # bulk-synchronous step re-expresses the slow rank's input time. `all_reduce` is
+                # the child name DLIO's own comment already claims and the one StorMer and DLRM
+                # emit, and the comm layer definition is broad, so children need no parent.
+                #
+                # Rank-symmetric by construction: every rank runs this line, so no rank enters or
+                # leaves the region that does not also enter or leave the barrier.
+                with dft_ai.comm.all_reduce:
+                    self.comm.barrier()
                 direct.mark("comm_barrier")
                 if self.do_checkpoint and (
                         self.steps_between_checkpoints >= 0) and overall_step == self.next_checkpoint_step:
@@ -861,7 +884,7 @@ class DLIOBenchmark(object):
                 else:
                     block_step += 1
             finally:
-                dft_ai.compute.stop(metadata=True)
+                dft_ai.compute.stop()
                 direct.mark("compute_annot_stop")
             dft_ai.pipeline.step.stop(metadata=True)
             direct.mark("step_stop")

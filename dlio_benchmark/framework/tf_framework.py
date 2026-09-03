@@ -76,7 +76,11 @@ class TFFramework(Framework):
     def trace_object(self, string, step, r):
         pass  # tf.profiler.experimental.Trace(string, step_num=step, _r=r)
 
-    @dft_ai.compute
+    # CHILD, not the parent. The parent region named `compute` is the step body in main.py, which
+    # is what contains the allreduce barrier and therefore what the analyzer's
+    # `compute_total - comm` split needs. Two nested regions both named `compute` would double
+    # count under the preset's narrow definition, so this one is `compute.step`.
+    @dft_ai.compute.step
     def compute(self, batch, epoch_number, step, computation_time):
         return self.model(batch, computation_time)
         # tf.function(self.model)(epoch_number, step, computation_time)
