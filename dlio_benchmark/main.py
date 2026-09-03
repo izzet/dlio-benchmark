@@ -17,7 +17,7 @@
 import os
 import math
 import sys
-from time import time
+from time import time, perf_counter
 import numpy as np
 
 # Reduce TF and CUDA logging
@@ -55,6 +55,75 @@ dlp = Profile(MODULE_DLIO_BENCHMARK)
 dftracer_initialize = True
 dftracer_finalize   = True
 dtracer             = None
+
+class _StepDirect:
+    """Direct monotonic account of the step body, rank 0 only.
+
+    Section 4j of liveflow_shm/T3-0-SHM-LOOP-CORONA.md measured a 41.3 ms step at 32 nodes with
+    only 0.46 ms of it waiting in `next()` and 9.36 ms of it sleeping: about 31 ms per step sits
+    inside the step body and is attributed to nothing. FETCH_DIRECT answered where the wait is NOT.
+    This answers where it is, with the same instrument (a monotonic clock, no trace region, no
+    analyzer) applied to every other piece of the step in order, so the parts and the residual add
+    up to the measured step.
+    """
+
+    __slots__ = ("_t", "acc", "steps", "total")
+
+    def __init__(self):
+        self._t = perf_counter()
+        self.acc = {}
+        self.steps = 0
+        self.total = 0.0
+
+    def begin(self):
+        self._t = perf_counter()
+
+    def mark(self, key):
+        now = perf_counter()
+        d = now - self._t
+        self._t = now
+        acc = self.acc
+        acc[key] = acc.get(key, 0.0) + d
+        return d
+
+    def end_step(self, step_seconds):
+        self.steps += 1
+        self.total += step_seconds
+
+    def report(self, epoch, rank, sleep_s):
+        """One line per epoch, same shape as FETCH_DIRECT: sums, per-step ms, share of the step."""
+        n = max(1, self.steps)
+        parts = sorted(self.acc.items(), key=lambda kv: -kv[1])
+        accounted = sum(self.acc.values())
+        residual = self.total - accounted
+        fields = " ".join(
+            f"{k}={1000.0 * v / n:.3f}" for k, v in parts
+        )
+        return (
+            f"STEP_DIRECT epoch={epoch} rank={rank} steps={self.steps} "
+            f"step_ms={1000.0 * self.total / n:.3f} sleep_ms={1000.0 * sleep_s:.3f} "
+            f"accounted_ms={1000.0 * accounted / n:.3f} "
+            f"residual_ms={1000.0 * residual / n:.3f} | {fields}"
+        )
+
+
+class _NullStepDirect:
+    """Every rank but 0 runs this: the calls stay in the code path, the cost is a no-op method."""
+
+    __slots__ = ()
+
+    def begin(self):
+        pass
+
+    def mark(self, key):
+        return 0.0
+
+    def end_step(self, step_seconds):
+        pass
+
+
+_NULL_STEP_DIRECT = _NullStepDirect()
+
 
 class DLIOBenchmark(object):
     """
@@ -711,13 +780,23 @@ class DLIOBenchmark(object):
         self.stats.start_block(epoch, block)
         self.stats.start_loading()
         batch_iter = loader.next()
+        # See _StepDirect: the direct account of every piece of the step body, rank 0 only, so the
+        # ~31 ms/step that section 4j found outside next() and outside the sleep is attributed to a
+        # named call rather than to "the step body".
+        direct = self._step_direct = (
+            _StepDirect() if self.my_rank == 0 else _NULL_STEP_DIRECT
+        )
         while True:
+            _step_t0 = perf_counter()
+            direct.begin()
             dft_ai.update(epoch=epoch, step=overall_step, args={"max_steps": max_steps})
             # Window boundary (gated by every_n) — replaces pipeline.step
             # control events. Only emits to Mofka at cadence boundaries.
             if self._window is not None:
                 self._window.start()
+            direct.mark("update_window_start")   # dft_ai.update + window.start
             dft_ai.pipeline.step.start(metadata=True)
+            direct.mark("step_start")
             try:
                 batch = next(batch_iter)
             except StopIteration:
@@ -739,7 +818,9 @@ class DLIOBenchmark(object):
                         self._emit_loader_stall(loader, epoch, overall_step)
                     self._window.stop()
                 break
+            direct.mark("next")
             self.stats.batch_loaded(epoch, overall_step, block)
+            direct.mark("stats_batch_loaded")
             # PARENT compute region, named `compute`, per liveflow_shm/ANNOTATION-SPEC.md.
             #
             # Was dft_ai.compute.step. The rename is numerically neutral -- same wrapped code, same
@@ -750,15 +831,23 @@ class DLIOBenchmark(object):
             # cannot double count at any depth; sub-regions (forward/backward) can then be added
             # freely as diagnostics, which is what StorMer already does.
             dft_ai.compute.start(metadata=True)
+            direct.mark("compute_annot_start")
             try:
                 computation_time = self.args.computation_time
                 if (isinstance(computation_time, dict) and len(computation_time) > 0) or (isinstance(computation_time, float) and  computation_time > 0):
                     self.framework.trace_object("Train", overall_step, 1)
                 self.stats.start_compute()
+                direct.mark("stats_start_compute")
+                # framework.compute() is the sleep AND, on the TensorFlow path, whatever the
+                # framework does with the batch. If next() returned a lazy batch, the read
+                # materialises in here, and fw_compute comes out far above sleep_ms.
                 self.framework.compute(batch, epoch, block_step, self.computation_time)
+                direct.mark("fw_compute")
                 self.stats.batch_processed(epoch, overall_step, block)
+                direct.mark("stats_batch_processed")
                 # This is the barrier to simulate allreduce. It is required to simulate the actual workloads.
                 self.comm.barrier()
+                direct.mark("comm_barrier")
                 if self.do_checkpoint and (
                         self.steps_between_checkpoints >= 0) and overall_step == self.next_checkpoint_step:
                     self.stats.end_block(epoch, block, block_step)
@@ -773,7 +862,9 @@ class DLIOBenchmark(object):
                     block_step += 1
             finally:
                 dft_ai.compute.stop(metadata=True)
+                direct.mark("compute_annot_stop")
             dft_ai.pipeline.step.stop(metadata=True)
+            direct.mark("step_stop")
             # LIVE EPOCH PROGRESS, so a horizon can be priced mid-epoch instead of only after the
             # epoch has finished. See section 4e of liveflow_shm/T3-0-SHM-LOOP-CORONA.md: at 32
             # nodes the cost-ranked staging decision was ready 60 s AFTER the epoch 1 boundary, so
@@ -788,6 +879,7 @@ class DLIOBenchmark(object):
                 if self._window_will_close():
                     self._emit_loader_stall(loader, epoch, overall_step)
                 at_boundary = self._window.stop()
+                direct.mark("window_stop")
                 # Mid-epoch plan application: at window boundaries, check if
                 # the optimizer has published new knobs. If so, rebuild the
                 # loader with updated parallelism (e.g., read_threads).
@@ -808,11 +900,16 @@ class DLIOBenchmark(object):
                         loader.finalize()
                         loader = new_loader
                         batch_iter = loader.next()
+                    # make_loader is where the gate and optimizer_context calls live
+                    # (_ensure_optimizer_runtime_started), so this covers both.
+                    direct.mark("boundary_rebuild")
             overall_step += 1
             # start a new block here
             if block_step == 1 and block != 1:
                 self.stats.start_block(epoch, block)
             self.stats.start_loading()
+            direct.mark("stats_start_loading")
+            direct.end_step(perf_counter() - _step_t0)
 
         self.comm.barrier()
         if self.do_checkpoint and (self.steps_between_checkpoints < 0) and (epoch == self.next_checkpoint_epoch):
@@ -930,6 +1027,17 @@ class DLIOBenchmark(object):
                             f"epoch_s={_ep_s:.3f} frac_of_epoch={_stall_s / _ep_s:.3f}")
                 except Exception as _e:                    # noqa: BLE001 - never fail the run
                     self.logger.output(f"{utcnow()} FETCH_DIRECT unavailable: {_e}")
+                # The rest of the step body, same instrument, same rank, same epoch. Read it
+                # against FETCH_DIRECT: next() plus the named parts plus the residual is the step.
+                try:
+                    _sd = getattr(self, "_step_direct", None)
+                    if _sd is not None and self.my_rank == 0 and getattr(_sd, "steps", 0):
+                        self.logger.output(
+                            f"{utcnow()} "
+                            + _sd.report(epoch, 0, self._comp_seconds(self.args.computation_time))
+                        )
+                except Exception as _e:                    # noqa: BLE001 - never fail the run
+                    self.logger.output(f"{utcnow()} STEP_DIRECT unavailable: {_e}")
                 self._last_steps = steps
                 self._last_per_step_compute = self._comp_seconds(self.args.computation_time)
                 self._last_epoch_seconds = max(1e-6, time() - getattr(self, "_epoch_t0", time()))
