@@ -258,47 +258,28 @@ class ConfigArguments:
         )
 
     def configure_dftracer(self, is_child=False, use_pid=False):
-        # THE FORK GAP, and it is writer-dependent.
+        # A forked child does NOT re-initialise the tracer, under any writer.
         #
-        # The premise below is true for the STDIO writer: a forked child inherits the open profiler
-        # fd, so re-initialising would only reopen a file that already works. It is FALSE for the
-        # SHM ring. The child inherits the mmap, but the LOGGER lives in the process, and nothing in
-        # the child ever calls initialize_log, so the POSIX interception in that process has no
-        # writer to hand its events to and they are silently discarded.
+        # For the STDIO writer the child inherits the open profiler fd, so there is nothing to do.
+        # For the SHM ring the child inherits the mmap and the POSIX fork interception, which fires
+        # under DFTRACER_INIT=FUNCTION and calls DFTracerCore::reinitialize() in the child by
+        # itself (T3-0 section 4o.4). Either way the child has a writer without asking for one.
         #
-        # Measured on un_loop_n8_r4 (8 nodes, PyTorch, NPZ): ZERO pread events across all 32 lanes,
-        # each lane carrying exactly one pid, the parent rank, which itself performs only 4 POSIX
-        # operations because the DataLoader workers do all the reading. Downstream that is
-        # reader_posix empty, node_read_gbs None, and `no_read_observed` on every storage-suspect
-        # window, so the barrier-attribution rule cannot run on any torch workload
-        # (T3-0 section 4o.3). cosmoflow never showed it because tf.data reads on threads inside
-        # the parent process, so there is no child to lose.
-        # GUARDED OFF, default. See T3-0-SHM-LOOP-CORONA.md section 4o.5.
+        # A DLIO_CHILD_TRACER_INIT escape hatch stood here between 4o.3 and 4o.5 on the belief that
+        # the child had to initialise the tracer itself under the SHM writer. That belief was
+        # wrong twice over: the call was redundant, and it was the prime suspect for the
+        # un_forkgate_n2 hang (f5z2E1iB7wMq), which wedged for 40 minutes after a make_loader
+        # reconfigure and held seven queued jobs behind it. Calling initialize on a singleton
+        # inherited across fork is the shape of a fork-safety deadlock, and it bought nothing.
         #
-        # This exception was added on the belief that a forked child had to initialise the tracer
-        # itself under the SHM writer. Section 4o.4 then showed that belief is wrong: the POSIX
-        # fork interception already fires under DFTRACER_INIT=FUNCTION and already calls
-        # DFTracerCore::reinitialize() in the child, so this call is REDUNDANT. What was actually
-        # missing was the buffer flush at child exit, fixed in dftracer 1396409.
-        #
-        # It is also under suspicion. un_forkgate_n2 (f5z2E1iB7wMq) was the first run to carry it
-        # and it HUNG: epoch 1 started 07:17:02 with 432 steps expected, a make_loader reconfigure
-        # at 07:17:41, then nothing for 40 minutes until it was cancelled, holding seven queued jobs
-        # behind it. Calling initialize on a singleton inherited across fork is exactly the shape of
-        # a fork-safety deadlock. I could NOT reproduce it off-cluster in 33 attempts, pressing both
-        # candidate locks (the BufferManager mutex with a reading thread, and the Python logging
-        # lock with eight threads across 30 forks; CPython registers os.register_at_fork handlers
-        # that release the logging lock in the child, which is why that path is safe).
-        #
-        # Not reproducing is not ruling out, and the cost of being wrong is asymmetric: a redundant
-        # call that might deadlock a worker against nothing gained. So the child does nothing again
-        # by default, and the exception is available for a deliberate experiment only. Once
-        # dftracer 1396409 is built and test_fork_flush.py passes, this should be deleted rather
-        # than re-enabled, because the flush fix makes it unnecessary.
-        _shm = (os.environ.get("DLIO_CHILD_TRACER_INIT", "0") == "1"
-                and (os.environ.get("LIVEFLOW_TRANSPORT", "").lower() == "liveflow"
-                     or bool(os.environ.get("DFTRACER_SHM_PREFIX"))))
-        if is_child and self.multiprocessing_context == "fork" and not _shm:
+        # What was actually missing was the FLUSH at child exit: a terminated persistent_workers
+        # DataLoader worker never finalizes, and dft_finalize's forked-child branch returned
+        # without flushing the child's BufferManager, so every event those workers produced was
+        # discarded. Measured on un_loop_n8_r4: zero pread events across all 32 lanes, one pid per
+        # lane and every one a parent rank, hence reader_posix empty, node_read_gbs None, and
+        # option 1's barrier rule inert on every torch workload. Fixed in dftracer 1396409 and
+        # gated by liveflow_shm/tests/test_fork_flush.py, which went FAIL to PASS on 2026-09-04.
+        if is_child and self.multiprocessing_context == "fork":
             return
         # Configure the profiler
         if DFTRACER_ENABLE:
