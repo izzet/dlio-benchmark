@@ -1246,6 +1246,10 @@ if _HAS_DFOPTIMIZER:
             # Cost per VALUE. Collapsing these to one number per knob would make "local" look as
             # expensive as a restripe, or a restripe look as cheap as a stage.
             cost_seconds={"pfs": 0.0, "local": _STAGE_COST, "restriped": _RESTRIPE_COST},
+            # Staging relocates the corpus, and the objective on the other side of it is a
+            # different quantity: a cosmoflow window went 37 s -> 5.6 s across the move. The
+            # planner resets every other knob's samples when this one is applied.
+            changes_regime=True,
             responds_to={
                 "storage_starved": {
                     "direction": "set", "set_to": "local",
