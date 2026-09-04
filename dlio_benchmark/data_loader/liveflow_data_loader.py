@@ -78,6 +78,14 @@ def _make_prefetch_depth(initial, max_depth):
 
 
 _PREFETCH_DEPTH_MAX = [32]
+# The pool width the NEXT rebuild should use, decided by reconfigure() and applied by read().
+# Module level rather than an instance attribute because DLIO's make_loader asks the framework for
+# a NEW loader object at every epoch boundary, so a decision stored on the object that made it
+# would be dropped exactly when it is due to be honoured. One rank is one process, so this is one
+# value per pool.
+# _UNSET distinguishes "nothing pending" from a pending "build at MAX", which is spelled None.
+_UNSET = object()
+_pending_pool_width = [_UNSET]
 
 
 def get_gate():
@@ -161,7 +169,12 @@ class LiveFlowDataLoader(BaseDataLoader):
             # `_pool_width` is normally None, meaning "build at MAX and let the gate carry every
             # change". reconfigure() sets it only to narrow the pool for a deep cut, where parking
             # would cost more than forking (see the note there).
-            workers = getattr(self, "_pool_width", None) or max_workers
+            if _pending_pool_width[0] is not _UNSET:
+                # A width deferred by reconfigure() is claimed here, at the one place a rebuild is
+                # safe, and cleared so it is honoured once rather than pinned forever.
+                self._pool_width = _pending_pool_width[0]
+                _pending_pool_width[0] = _UNSET
+            workers = self._pool_width or max_workers
         else:
             workers = max(0, int(read_threads))
 
@@ -264,33 +277,56 @@ class LiveFlowDataLoader(BaseDataLoader):
         # against every subsequent batch paying head-of-line blocking.
         built = self._built_workers or 0
         want = max(1, int(read_threads))
+        before = gate.limit
         ratio = float(os.environ.get("LIVEFLOW_GATE_PARK_RATIO", "0.5"))
         shrink = os.environ.get("LIVEFLOW_GATE_SHRINK", "1") == "1"
 
-        # A pool narrower than the limit cannot deliver the limit. Raising the knob above the
-        # forked width would otherwise be applied to the gate, acked, and recorded as a successful
-        # action while concurrency stayed pinned at the old width -- the silently-ignored knob this
-        # work keeps finding. Growing back to MAX costs one fork and makes every later move free.
+        # RECONFIGURE MUST NOT TEAR DOWN THE POOL THE CONSUMER IS DRAWING FROM. THIS WEDGED TWO
+        # RUNS AND COST TWO ALLOCATIONS.
+        #
+        # This method exists precisely because make_loader returns the SAME loader object so the
+        # `batch_iter` generator already running inside the training loop stays alive. That
+        # generator holds `src`, the DataLoader object captured when it started. Calling
+        # shutdown_workers() here kills that object's worker processes and then sets
+        # `self._dataset` to a NEW DataLoader, so the live generator is left waiting on a queue
+        # that no worker will ever fill again. The consumer blocks forever, which is exactly what
+        # was observed: un_forkgate_n2 (f5z2E1iB7wMq) and un_forkgate2_n2 (f5z3GQv8S7eF) both went
+        # silent immediately after a reconfigure, completed about 7 of 432 steps, and had to be
+        # killed by a wall limit. The epoch-boundary control un_forkgate3_n2 (f5z3nMDcP8ns), which
+        # applies knobs only where the loader is rebuilt anyway, completed the same epoch in 544 s.
+        #
+        # AND THE SHRINK TEST FIRED WHEN NOTHING HAD CHANGED, which is what made it reachable at
+        # all. It compared the requested limit against the FORKED WIDTH, but the pool is built at
+        # MAX on purpose and the steady state legitimately sits below it, so at MAXW=24 with the
+        # shipped read_threads=4 the test `4 < 24 * 0.5` is true on every single call. The plan
+        # that wedged un_forkgate2_n2 moved PREFETCH and left read_threads at 4, and a pool
+        # teardown ran anyway. The comparison belongs against the limit in force, which is what a
+        # cut means.
+        #
+        # So: pool changes are DEFERRED to the next epoch boundary, where make_loader retires the
+        # old pool and builds a new one with no iterator in flight. Mid-epoch the knob still moves,
+        # through the gate, which is the whole design of this loader.
         if built and want > built:
-            _mark("RECONFIGURE gate -> %d exceeds the %d forked workers; regrowing the pool "
-                  "(a wider limit cannot be delivered by a narrower pool)" % (want, built))
-            self._pool_width = None          # None means "build at MAX"
-            self.shutdown_workers("regrow pool")
-            self.read(read_threads=read_threads, prefetch_size=prefetch_size)
+            # A pool narrower than the limit cannot deliver the limit, so the gate is set to what
+            # the pool CAN deliver rather than to a number that would be acked and not honoured.
+            _pending_pool_width[0] = None    # None means "build at MAX"
+            _mark("RECONFIGURE gate -> %d exceeds the %d forked workers; the gate takes %d now and "
+                  "the pool regrows at the next epoch boundary (a rebuild mid-epoch would strand "
+                  "the running iterator)" % (want, built, built))
+            gate.set_limit(built)
             return
 
-        if shrink and built > 1 and want < max(1, int(built * ratio)):
-            _mark("RECONFIGURE gate %d -> %d is a DEEP CUT (%d workers forked); shrinking the pool "
-                  "instead of parking %d of them"
-                  % (gate.limit, want, built, built - want))
-            # Build at exactly the requested width, so worker count equals concurrency and no
-            # worker is ever parked. A later move up regrows the pool via the branch above.
-            self._pool_width = want
-            self.shutdown_workers("shrink pool")
-            self.read(read_threads=read_threads, prefetch_size=prefetch_size)
-            return
+        if shrink and built > 1 and want < max(1, int(before * ratio)):
+            # A deep cut is cheaper to fork than to park (phase 20: +19.2% through the gate against
+            # +3.2% through a rebuild, because torch delivers batches in worker order and a parked
+            # worker head-of-line blocks the consumer). That trade still holds, but it is paid at
+            # the next epoch boundary. Until then the cut is applied by parking, and the cost of
+            # parking is the +19.2% above, for the remainder of this epoch only.
+            _pending_pool_width[0] = want
+            _mark("RECONFIGURE gate %d -> %d is a DEEP CUT (%d workers forked); parking now and "
+                  "shrinking the pool at the next epoch boundary"
+                  % (before, want, built))
 
-        before = gate.limit
         after = gate.set_limit(read_threads)
         _mark("RECONFIGURE gate %d -> %d mid-epoch (same loader, same iterator, no fork)"
               % (before, after))
@@ -316,10 +352,13 @@ class LiveFlowDataLoader(BaseDataLoader):
                 _mark("PREFETCH %s -> %s applied via the dynamic buffer (no rebuild)"
                       % (before_d, after_d))
             elif os.environ.get("LIVEFLOW_GATE_REBUILD_PREFETCH", "0") == "1":
-                _mark("PREFETCH %s -> %s requires a rebuild (opted in); rebuilding"
+                # Deferred for the same reason as the pool width above: a rebuild here strands the
+                # generator the training loop is iterating. make_loader rebuilds at the next epoch
+                # boundary from self._args, which already carries the new prefetch_size, so this
+                # needs no pending state of its own.
+                _mark("PREFETCH %s -> %s requires a rebuild (opted in); deferred to the next epoch "
+                      "boundary, because rebuilding mid-epoch strands the running iterator"
                       % (self._built_prefetch, prefetch_size))
-                self.shutdown_workers("prefetch rebuild")
-                self.read(read_threads=read_threads, prefetch_size=prefetch_size)
             else:
                 _mark("PREFETCH %s -> %s NOT APPLIED: prefetch_factor is a torch constructor "
                       "argument and cannot be gated. Set LIVEFLOW_GATE_REBUILD_PREFETCH=1 to "
