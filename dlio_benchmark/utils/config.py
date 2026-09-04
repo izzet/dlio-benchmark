@@ -258,8 +258,24 @@ class ConfigArguments:
         )
 
     def configure_dftracer(self, is_child=False, use_pid=False):
-        # with "multiprocessing_context=fork" the profiler file remains open in the child process
-        if is_child and self.multiprocessing_context == "fork":
+        # THE FORK GAP, and it is writer-dependent.
+        #
+        # The premise below is true for the STDIO writer: a forked child inherits the open profiler
+        # fd, so re-initialising would only reopen a file that already works. It is FALSE for the
+        # SHM ring. The child inherits the mmap, but the LOGGER lives in the process, and nothing in
+        # the child ever calls initialize_log, so the POSIX interception in that process has no
+        # writer to hand its events to and they are silently discarded.
+        #
+        # Measured on un_loop_n8_r4 (8 nodes, PyTorch, NPZ): ZERO pread events across all 32 lanes,
+        # each lane carrying exactly one pid, the parent rank, which itself performs only 4 POSIX
+        # operations because the DataLoader workers do all the reading. Downstream that is
+        # reader_posix empty, node_read_gbs None, and `no_read_observed` on every storage-suspect
+        # window, so the barrier-attribution rule cannot run on any torch workload
+        # (T3-0 section 4o.3). cosmoflow never showed it because tf.data reads on threads inside
+        # the parent process, so there is no child to lose.
+        _shm = (os.environ.get("LIVEFLOW_TRANSPORT", "").lower() == "liveflow"
+                or bool(os.environ.get("DFTRACER_SHM_PREFIX")))
+        if is_child and self.multiprocessing_context == "fork" and not _shm:
             return
         # Configure the profiler
         if DFTRACER_ENABLE:

@@ -987,7 +987,19 @@ class DLIOBenchmark(object):
             )
             # Kept on the object so a mid-epoch horizon can be projected from progress.
             self._steps_per_epoch = _steps_per_epoch
-            _default_every_n = max(1, _steps_per_epoch // 5)
+            # DERIVED FROM THE WORKLOAD, never passed in. See liveflow_shm/HORIZON-CONTRACT.md.
+            #
+            # A cadence carried over from another cell is a silent way to switch the controller off.
+            # `every_n=512` was chosen for cosmoflow, which runs 12288 steps per epoch, and then
+            # reused for unet3d, which runs 108: the window could never close on cadence, only the
+            # epoch-end flush closed it, and the whole 3-epoch run produced 5 windows per agent with
+            # a median wall of 186 s, one entire epoch. With `min_samples=3` nothing could be
+            # characterised even in principle (T3-0 section 4o.2).
+            #
+            # steps_per_epoch // 10 gives ~10 windows per epoch on any workload, which is the
+            # quantity that actually matters: enough windows for the sample floor to be reachable,
+            # few enough that the analyzer keeps up.
+            _default_every_n = max(1, _steps_per_epoch // 10)
             _initial_every_n = int(os.environ.get(
                 "DLIO_WINDOW_EVERY_N", _default_every_n
             ))
