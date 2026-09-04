@@ -273,8 +273,31 @@ class ConfigArguments:
         # window, so the barrier-attribution rule cannot run on any torch workload
         # (T3-0 section 4o.3). cosmoflow never showed it because tf.data reads on threads inside
         # the parent process, so there is no child to lose.
-        _shm = (os.environ.get("LIVEFLOW_TRANSPORT", "").lower() == "liveflow"
-                or bool(os.environ.get("DFTRACER_SHM_PREFIX")))
+        # GUARDED OFF, default. See T3-0-SHM-LOOP-CORONA.md section 4o.5.
+        #
+        # This exception was added on the belief that a forked child had to initialise the tracer
+        # itself under the SHM writer. Section 4o.4 then showed that belief is wrong: the POSIX
+        # fork interception already fires under DFTRACER_INIT=FUNCTION and already calls
+        # DFTracerCore::reinitialize() in the child, so this call is REDUNDANT. What was actually
+        # missing was the buffer flush at child exit, fixed in dftracer 1396409.
+        #
+        # It is also under suspicion. un_forkgate_n2 (f5z2E1iB7wMq) was the first run to carry it
+        # and it HUNG: epoch 1 started 07:17:02 with 432 steps expected, a make_loader reconfigure
+        # at 07:17:41, then nothing for 40 minutes until it was cancelled, holding seven queued jobs
+        # behind it. Calling initialize on a singleton inherited across fork is exactly the shape of
+        # a fork-safety deadlock. I could NOT reproduce it off-cluster in 33 attempts, pressing both
+        # candidate locks (the BufferManager mutex with a reading thread, and the Python logging
+        # lock with eight threads across 30 forks; CPython registers os.register_at_fork handlers
+        # that release the logging lock in the child, which is why that path is safe).
+        #
+        # Not reproducing is not ruling out, and the cost of being wrong is asymmetric: a redundant
+        # call that might deadlock a worker against nothing gained. So the child does nothing again
+        # by default, and the exception is available for a deliberate experiment only. Once
+        # dftracer 1396409 is built and test_fork_flush.py passes, this should be deleted rather
+        # than re-enabled, because the flush fix makes it unnecessary.
+        _shm = (os.environ.get("DLIO_CHILD_TRACER_INIT", "0") == "1"
+                and (os.environ.get("LIVEFLOW_TRANSPORT", "").lower() == "liveflow"
+                     or bool(os.environ.get("DFTRACER_SHM_PREFIX"))))
         if is_child and self.multiprocessing_context == "fork" and not _shm:
             return
         # Configure the profiler
