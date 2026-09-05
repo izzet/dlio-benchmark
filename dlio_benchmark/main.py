@@ -1250,6 +1250,9 @@ if _HAS_DFOPTIMIZER:
             # different quantity: a cosmoflow window went 37 s -> 5.6 s across the move. The
             # planner resets every other knob's samples when this one is applied.
             changes_regime=True,
+            # And it relocates the bytes, so its gain is bounded by what the destination device can
+            # deliver and its cost scales with how much there is to move (T3-0 section 4s).
+            relocates_data=True,
             responds_to={
                 "storage_starved": {
                     "direction": "set", "set_to": "local",
