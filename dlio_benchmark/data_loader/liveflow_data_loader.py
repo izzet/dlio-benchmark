@@ -431,6 +431,42 @@ class LiveFlowDataLoader(BaseDataLoader):
         if iterator is not None:
             _mark("RETIRE workers=%s reason=%s (shutdown before rebuild)"
                   % (getattr(dataset, "num_workers", "?"), reason or "unspecified"))
+            # STAGGER THE EXITS. Retiring 24 workers at once delivers 24 SIGCHLDs to this process
+            # in a burst, and MVAPICH's async event thread, which exists because DLIO initialises
+            # MPI with THREAD_MULTIPLE, is blocked in ibv_get_cq_event. An interrupted wait there
+            # is reported as `Got FATAL event CQ error on CQ (nil): Interrupted system call (4)`
+            # and kills the rank. Measured on un_loop_n8_10e_r1 (f5z5EzMFcvTH): rank 14 died on the
+            # sixth of six epoch-boundary retirements, about one fatal in 192 retirement events
+            # across the run, so this is a race and not a deterministic fault.
+            #
+            # `_workers_done_event` is what tells a worker to leave its loop, and torch's own
+            # shutdown sets it too. Setting it first and then joining each worker with a small
+            # timeout spreads the exits over time instead of bunching them. Whatever has not left
+            # is terminated by torch's own path below, unchanged.
+            #
+            # TESTED AND IT DOES NOT WORK, so it is OFF by default. `retire_storm_n2`
+            # (f5z7nk9dgfvF), 2 nodes, 200 retire-and-rebuild cycles per rank: the unmitigated arm
+            # died with the production fatal after about 60 cycles, and the staggered arm at 0.05 s
+            # died the same way. Lowering the MPI thread level to SERIALIZED failed too
+            # (f5z7pWMcexzb). The path is kept because it is one env variable away from being
+            # re-tested, and it is not paid for by default: 24 workers at 0.05 s is 1.2 s per
+            # retirement for no measured benefit. See T3-0 section 4s.5.
+            gap = float(os.environ.get("LIVEFLOW_RETIRE_STAGGER_S", "0") or 0.0)
+            workers = list(getattr(iterator, "_workers", None) or [])
+            if gap > 0.0 and workers:
+                try:
+                    ev = getattr(iterator, "_workers_done_event", None)
+                    if ev is not None:
+                        ev.set()
+                    left = 0
+                    for w in workers:
+                        w.join(timeout=gap)
+                        if not w.is_alive():
+                            left += 1
+                    _mark("RETIRE staggered gap=%.3fs workers=%d exited_before_terminate=%d"
+                          % (gap, len(workers), left))
+                except Exception as exc:   # a stagger that fails must not stop the retirement
+                    _mark("RETIRE stagger skipped: %s" % exc)
             try:
                 iterator._shutdown_workers()
             except Exception as exc:  # a failed worker must not prevent rank teardown
