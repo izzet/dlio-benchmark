@@ -87,6 +87,25 @@ _PREFETCH_DEPTH_MAX = [32]
 _UNSET = object()
 _pending_pool_width = [_UNSET]
 
+# THE POOL IS BUILT ONCE PER PROCESS AND IS NEVER TORN DOWN DURING A RUN.
+#
+# Orchestrator decision 2026-09-04, after the node sweep (T3-0 section 4s.6) showed the retirement
+# fatal is in MVAPICH's async event thread and not in any node: 15 of 17 screened pairs died within
+# 800 retirement events, and a node that survived one screen failed the next. There is nothing to
+# exclude, so the retirement storm is removed by construction instead. A knob change that cannot be
+# applied inside the existing pool is REFUSED with a recorded reason rather than rebuilt.
+#
+# It lives at module scope because DLIO asks the framework for a NEW loader object at every epoch
+# boundary. A pool held on the object would be rebuilt every epoch no matter what this file did,
+# which is exactly the storm: nine boundaries times 32 ranks is 288 retirement events per 10-epoch
+# run, at about 1 fatal in 480.
+#
+# Sample ORDER is unaffected: dlio_sampler computes a fixed index list at construction with no
+# per-epoch shuffle, so a fresh loader per epoch was already iterating the same order.
+_POOL = {"dataset": None, "workers": None, "prefetch": None, "prefetch_obj": None}
+# Knob moves this policy refused, for the record and for the readout.
+_REFUSALS = []
+
 
 def get_gate():
     return _GATE
@@ -169,11 +188,19 @@ class LiveFlowDataLoader(BaseDataLoader):
             # `_pool_width` is normally None, meaning "build at MAX and let the gate carry every
             # change". reconfigure() sets it only to narrow the pool for a deep cut, where parking
             # would cost more than forking (see the note there).
-            if _pending_pool_width[0] is not _UNSET:
-                # A width deferred by reconfigure() is claimed here, at the one place a rebuild is
-                # safe, and cleared so it is honoured once rather than pinned forever.
-                self._pool_width = _pending_pool_width[0]
-                _pending_pool_width[0] = _UNSET
+            # ADOPT THE PROCESS POOL IF ONE EXISTS. A new loader object at an epoch boundary
+            # takes over the pool that is already running instead of forking a replacement, which
+            # is what removes the retirement storm.
+            if _POOL["dataset"] is not None:
+                self._dataset = _POOL["dataset"]
+                self._built_workers = _POOL["workers"]
+                self._built_prefetch = _POOL["prefetch"]
+                self._prefetch = _POOL["prefetch_obj"]
+                _mark("ADOPT pool workers=%s prefetch=%s gate_limit=%s  (built once, never torn "
+                      "down during the run)"
+                      % (self._built_workers, self._built_prefetch,
+                         get_gate().limit if use_gate else "n/a"))
+                return
             workers = self._pool_width or max_workers
         else:
             workers = max(0, int(read_threads))
@@ -214,6 +241,9 @@ class LiveFlowDataLoader(BaseDataLoader):
                                    **kwargs)
         self._built_workers = workers
         self._built_prefetch = prefetch_size
+        _POOL["dataset"] = self._dataset
+        _POOL["workers"] = workers
+        _POOL["prefetch"] = prefetch_size
 
         if os.environ.get("LIVEFLOW_DYNAMIC_PREFETCH", "0") == "1":
             import sys as _sys
@@ -225,6 +255,7 @@ class LiveFlowDataLoader(BaseDataLoader):
                                          int(os.environ.get("LIVEFLOW_MAX_PREFETCH", "32")))
             self._prefetch = DynamicPrefetch(self._dataset, depth=depth,
                                              max_depth=_PREFETCH_DEPTH_MAX[0])
+            _POOL["prefetch_obj"] = self._prefetch
             _mark("DYNAMIC PREFETCH on, depth=%d (prefetch_size is now a live knob)"
                   % self._prefetch.depth)
 
@@ -253,6 +284,14 @@ class LiveFlowDataLoader(BaseDataLoader):
             # returning here made DLIO take the reconfigure path and drop the knob entirely --
             # the control arm applied 1 of 3 knob changes and looked slower for the wrong reason.
             # An in-place reconfigure that does not reconfigure is worse than not having one.
+            # The gate-off control arm is the one place a rebuild is the point, so it is the ABLATION
+            # this policy is judged against. It carries the retirement risk by design.
+            if os.environ.get("LIVEFLOW_ALLOW_POOL_TEARDOWN", "0") != "1":
+                _REFUSALS.append(("rebuild_control_arm", None, read_threads,
+                                  "teardown not permitted; set LIVEFLOW_ALLOW_POOL_TEARDOWN=1"))
+                _mark("REFUSED gate=off rebuild: the control arm needs a teardown, which is not "
+                      "permitted during a run. Set LIVEFLOW_ALLOW_POOL_TEARDOWN=1 to run it.")
+                return
             _mark("RECONFIGURE gate=off -> falling back to a real rebuild (control arm)")
             self._dataset = None
             self._built_workers = None
@@ -307,24 +346,25 @@ class LiveFlowDataLoader(BaseDataLoader):
         # old pool and builds a new one with no iterator in flight. Mid-epoch the knob still moves,
         # through the gate, which is the whole design of this loader.
         if built and want > built:
-            # A pool narrower than the limit cannot deliver the limit, so the gate is set to what
-            # the pool CAN deliver rather than to a number that would be acked and not honoured.
-            _pending_pool_width[0] = None    # None means "build at MAX"
-            _mark("RECONFIGURE gate -> %d exceeds the %d forked workers; the gate takes %d now and "
-                  "the pool regrows at the next epoch boundary (a rebuild mid-epoch would strand "
-                  "the running iterator)" % (want, built, built))
+            # REFUSED, and the gate takes what the pool can actually deliver. Growing the pool needs
+            # a fork, a fork needs the old pool retired, and a retirement is what kills ranks.
+            _REFUSALS.append(("read_threads", before, want, "would need a wider pool"))
+            _mark("REFUSED read_threads %d -> %d: it exceeds the %d forked workers and growing the "
+                  "pool would need a teardown. The gate takes %d, which is what the pool can "
+                  "deliver, and the refusal is recorded rather than acked as applied."
+                  % (before, want, built, built))
             gate.set_limit(built)
             return
 
         if shrink and built > 1 and want < max(1, int(before * ratio)):
-            # A deep cut is cheaper to fork than to park (phase 20: +19.2% through the gate against
-            # +3.2% through a rebuild, because torch delivers batches in worker order and a parked
-            # worker head-of-line blocks the consumer). That trade still holds, but it is paid at
-            # the next epoch boundary. Until then the cut is applied by parking, and the cost of
-            # parking is the +19.2% above, for the remainder of this epoch only.
-            _pending_pool_width[0] = want
-            _mark("RECONFIGURE gate %d -> %d is a DEEP CUT (%d workers forked); parking now and "
-                  "shrinking the pool at the next epoch boundary"
+            # The cut is APPLIED, by parking, and the pool is NOT shrunk. Phase 20 priced parking a
+            # deep cut at +19.2% against +3.2% for a rebuild, and that trade is now refused: a
+            # rebuild costs a retirement, a retirement kills a rank about once in 480, and a run
+            # that dies is worth less than one that is 19% slow. The knob still moves.
+            _REFUSALS.append(("pool_shrink", built, want, "teardown not permitted during a run"))
+            _mark("PARKING a deep cut %d -> %d against %d forked workers, and NOT shrinking the "
+                  "pool: the cut is applied through the gate and costs head-of-line blocking, "
+                  "which is cheaper than a teardown that can kill the rank."
                   % (before, want, built))
 
         after = gate.set_limit(read_threads)
@@ -352,12 +392,13 @@ class LiveFlowDataLoader(BaseDataLoader):
                 _mark("PREFETCH %s -> %s applied via the dynamic buffer (no rebuild)"
                       % (before_d, after_d))
             elif os.environ.get("LIVEFLOW_GATE_REBUILD_PREFETCH", "0") == "1":
-                # Deferred for the same reason as the pool width above: a rebuild here strands the
-                # generator the training loop is iterating. make_loader rebuilds at the next epoch
-                # boundary from self._args, which already carries the new prefetch_size, so this
-                # needs no pending state of its own.
-                _mark("PREFETCH %s -> %s requires a rebuild (opted in); deferred to the next epoch "
-                      "boundary, because rebuilding mid-epoch strands the running iterator"
+                # REFUSED. There is no longer a boundary at which a rebuild is safe, because the
+                # pool is never torn down. Opting in asks for a teardown and gets a refusal.
+                _REFUSALS.append(("prefetch_size", self._built_prefetch, prefetch_size,
+                                  "prefetch_factor is a constructor argument"))
+                _mark("REFUSED prefetch %s -> %s: prefetch_factor is a torch constructor argument "
+                      "and applying it needs a rebuild, which is not permitted during a run. Set "
+                      "LIVEFLOW_DYNAMIC_PREFETCH=1 to make prefetch depth a live knob instead."
                       % (self._built_prefetch, prefetch_size))
             else:
                 _mark("PREFETCH %s -> %s NOT APPLIED: prefetch_factor is a torch constructor "
@@ -426,6 +467,23 @@ class LiveFlowDataLoader(BaseDataLoader):
         shutdown hook is the supported lifecycle used by its DataLoader destructor; call it
         explicitly here so the old pool has exited before a replacement is constructed.
         """
+        # THE RETIREMENT ITSELF, REFUSED BY DEFAULT.
+        #
+        # Every fabric-stack fatal this project has seen came from here: torch signals the worker
+        # processes, MVAPICH's async event thread takes EINTR in ibv_get_cq_event and treats it as
+        # a fatal CQ error, and the rank dies. The node sweep (4s.6) closed the last alternative
+        # explanation, so the pool is not retired during a run and a knob that would need a
+        # teardown is refused in reconfigure() instead.
+        #
+        # LIVEFLOW_ALLOW_POOL_TEARDOWN=1 restores the old behaviour exactly, the ablation.
+        if os.environ.get("LIVEFLOW_ALLOW_POOL_TEARDOWN", "0") != "1":
+            _REFUSALS.append(("teardown", None, None, reason or "unspecified"))
+            _mark("REFUSED teardown reason=%s: the pool is built once and kept for the run. "
+                  "Retiring 24 workers has killed a rank about once in 480 retirements "
+                  "(T3-0 4s.5, 4s.6), and nothing about this pool needs replacing."
+                  % (reason or "unspecified"))
+            return
+
         dataset = self._dataset
         iterator = getattr(dataset, "_iterator", None) if dataset is not None else None
         if iterator is not None:
@@ -475,6 +533,10 @@ class LiveFlowDataLoader(BaseDataLoader):
         self._built_workers = None
         self._built_prefetch = None
         self._prefetch = None
+        _POOL["dataset"] = None
+        _POOL["workers"] = None
+        _POOL["prefetch"] = None
+        _POOL["prefetch_obj"] = None
 
     @dlp.log
     def finalize(self):
@@ -489,6 +551,10 @@ class LiveFlowDataLoader(BaseDataLoader):
         # case the rule currently cannot see and acts on anyway.
         if self._consumer_boundary is not None:
             self._stall_s, self._steps = self._consumer_boundary.totals
+        if _REFUSALS:
+            from collections import Counter as _C
+            _mark("KNOB REFUSALS %s  (moves this policy declined rather than rebuilding the pool)"
+                  % dict(_C(r[0] for r in _REFUSALS)))
         if self._steps:
             _mark("STALL total=%.3fs steps=%d mean=%.1fms  (consumer blocked waiting for a batch; "
                   "this is the part of fetch that is ON the critical path)"
