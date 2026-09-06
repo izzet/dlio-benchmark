@@ -147,6 +147,24 @@ class DLIOBenchmark(object):
         return (getattr(self, "_data_source_reason", None),
                 getattr(self, "_data_source_completed_at", None))
 
+    def _liveflow_ack_pending(self, action, old_value, new_value, ctx):
+        """Keep a relocation's plan so its EFFECT can be acked when it begins (T3-0 4s.37).
+
+        The copy finishes inside `make_loader`; the loader that reads the copied bytes is not
+        built until the next epoch boundary, and every window in between reads the OLD file list.
+        Measured on `cf_fz_loop_n32_r1f`: copy done 08:13:34, loader rebuilt 08:21:54, and the 17
+        windows between them were 14 to 66 s PFS windows credited to `local` against a 25 s `pfs`
+        arm. The two arms tied and all 32 nodes reverted, one window before the rebuild.
+
+        So the plan is held here and acked a second time from the rebuild, with `effective_at`.
+        Only for a knob that actually relocated: a declined or no-op plan has nothing to wait for.
+        """
+        if action.knob_id.split(".")[-1] != "data_source":
+            return
+        if getattr(self, "_data_source_reason", None) != "relocated":
+            return
+        self._data_source_pending_ack = (action, old_value, new_value, ctx)
+
     """
     The Benchmark represents the I/O behavior of deep learning applications.
     """
@@ -580,6 +598,37 @@ class DLIOBenchmark(object):
                 "epoch_seconds": getattr(self, "_last_epoch_seconds", 0.0),
                 "epochs_remaining": after + 1}
 
+    def _note_data_source_effective(self, epoch):
+        """Report `effective_at` once, from the first loader built on the relocated file list.
+
+        BEST EFFORT AND SILENT ON FAILURE, like every other actuator path here: a control-plane
+        message must never be able to fail the training run it is describing. If the ack cannot be
+        sent the planner keeps the move PENDING, which is the safe state -- it neither confirms nor
+        reverts something it has not measured.
+        """
+        _ds = getattr(self, "_data_source", "pfs")
+        if getattr(self, "_data_source_loader_built_for", "pfs") == _ds:
+            return
+        self._data_source_loader_built_for = _ds
+        _eff = time()
+        self._data_source_effective_at = _eff
+        self.logger.output(
+            f"{utcnow()} data_source EFFECTIVE: source={_ds} epoch={epoch} "
+            f"effective_at={_eff} folder={self.args.data_folder} "
+            f"files={len(self.args.file_list_train)}")
+        pending = getattr(self, "_data_source_pending_ack", None)
+        if not pending:
+            return
+        action, old_value, new_value, ctx = pending
+        self._data_source_pending_ack = None
+        try:
+            ctx.ack_action(action, old_value, new_value, status="applied",
+                           reason="effective",
+                           completed_at=getattr(self, "_data_source_completed_at", None),
+                           effective_at=_eff)
+        except Exception as e:                                # noqa: BLE001
+            self.logger.output(f"{utcnow()} data_source effective ack unavailable: {e}")
+
     def make_loader(self, epoch, prefetch_size=None, read_threads=None, data_source=None):
         """Create or reuse a training DataLoader for the given epoch.
 
@@ -803,6 +852,11 @@ class DLIOBenchmark(object):
                 )
             loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN, epoch=epoch)
             loader.read(read_threads=read_threads, prefetch_size=prefetch_size)
+            # THE MOMENT THE NEW SOURCE IS IN USE. `get_loader` reads `args.file_list_train`, so
+            # this build is where a relocation stops being a resolved path and starts being the
+            # bytes the workload reads. The cached and reconfigured branches above return a loader
+            # built on the PREVIOUS list and deliberately do not report anything.
+            self._note_data_source_effective(epoch)
             self._cached_loader = loader
             self._cached_prefetch = prefetch_size
             self._cached_read_threads = read_threads
