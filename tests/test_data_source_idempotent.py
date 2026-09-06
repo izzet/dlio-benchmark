@@ -55,10 +55,12 @@ def main():
     check("the guard reads _data_source defensively, as every other reader does",
           'getattr(self, "_data_source", "pfs")' in guard_block,
           "guard block does not use getattr")
+    # `self._data_source` exactly, not `self._data_source_reason` and friends, which are
+    # assignments to different attributes and are fine.
+    _between = src[i_guard:i_resolve].replace('getattr(self, "_data_source", "pfs")', "")
+    _bare = re.findall(r"self\._data_source(?![A-Za-z0-9_])", _between)
     check("and no unguarded self._data_source read precedes the resolver",
-          "self._data_source" not in src[i_guard:i_resolve].replace(
-              'getattr(self, "_data_source", "pfs")', ""),
-          "unguarded read between the guard and the resolver")
+          not _bare, "%d unguarded reads between the guard and the resolver" % len(_bare))
 
     # 2c. THE ACK HOOK. Without it the ack carries reason=None and the planner's completion rule
     # can never fire on a real run; it fired only in the replay, which synthesises the ack.
