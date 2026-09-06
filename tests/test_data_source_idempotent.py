@@ -39,7 +39,7 @@ def main():
           "from time import time" in src)
 
     # 2. THE GUARD, IN FRONT OF THE RESOLVER. Idempotence must not depend on state written after it.
-    i_guard = src.find("if data_source == self._data_source:")
+    i_guard = src.find("if data_source == _current_ds:")
     i_resolve = src.find("_new = _resolve(")
     check("a data_source already applied short-circuits", i_guard != -1)
     check("and it does so BEFORE the resolver runs, not after",
@@ -47,11 +47,29 @@ def main():
           "guard@%d resolve@%d" % (i_guard, i_resolve))
     check("the short-circuit reports no_move_needed", "reason=no_move_needed" in src)
 
+    # 2b. THE GUARD MUST NOT READ STATE THAT DOES NOT EXIST YET. `_data_source` is created on the
+    # success path, so on the first call it is absent; reading it unguarded raised
+    # "'DLIOBenchmark' object has no attribute '_data_source'" 17,920 times in cf_fz_loop_n32_r1d
+    # and the resolver never ran. The guard added to stop a SECOND copy stopped the FIRST (4s.33).
+    guard_block = src[i_guard - 400:i_resolve] if i_guard != -1 else ""
+    check("the guard reads _data_source defensively, as every other reader does",
+          'getattr(self, "_data_source", "pfs")' in guard_block,
+          "guard block does not use getattr")
+    check("and no unguarded self._data_source read precedes the resolver",
+          "self._data_source" not in src[i_guard:i_resolve].replace(
+              'getattr(self, "_data_source", "pfs")', ""),
+          "unguarded read between the guard and the resolver")
+
+    # 2c. THE ACK HOOK. Without it the ack carries reason=None and the planner's completion rule
+    # can never fire on a real run; it fired only in the replay, which synthesises the ack.
+    check("the actuator exposes what it did through _liveflow_ack_reason",
+          "def _liveflow_ack_reason(self, knob):" in src)
+
     # 3. STATE BEFORE LOGGING. The copy is irreversible; nothing after it may lose the fact.
     # Search from the resolver onward: the FIRST ack line in the file belongs to the guard's
     # short-circuit, which legitimately precedes the success path's state assignment.
     i_state = src.find("self._data_source = data_source", i_resolve)
-    i_log = src.find("data_source ack: {self._data_source}", i_state)
+    i_log = src.find("data_source ack: {_current_ds}", i_state)
     check("the applied state is assigned before the ack is logged",
           i_state != -1 and i_log != -1 and i_state < i_log,
           "state@%d log@%d" % (i_state, i_log))

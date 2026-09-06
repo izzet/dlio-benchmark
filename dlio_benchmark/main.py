@@ -125,11 +125,28 @@ class _NullStepDirect:
 _NULL_STEP_DIRECT = _NullStepDirect()
 
 
+def _liveflow_ack_reason_mixin():
+    """Nothing: the hook is defined on DLIOBenchmark below. Kept as a marker for grep."""
+
+
 class _AlreadyApplied(Exception):
     """This node already holds the requested data_source; do not resolve again."""
 
 
 class DLIOBenchmark(object):
+    def _liveflow_ack_reason(self, knob):
+        """What the actuator actually did with `knob`, for the ack (T3-0 4s.33).
+
+        The runtime sends the ack AFTER the tunable function returns, so by then this object knows
+        whether a relocation copied, was already in place, or was declined, and when it finished.
+        Without this the ack carries `reason=None` and the planner's completion rule (4s.31) can
+        never fire on a real run -- it only ever fired in the replay, which synthesises the ack.
+        """
+        if knob != "data_source":
+            return None, None
+        return (getattr(self, "_data_source_reason", None),
+                getattr(self, "_data_source_completed_at", None))
+
     """
     The Benchmark represents the I/O behavior of deep learning applications.
     """
@@ -666,9 +683,16 @@ class DLIOBenchmark(object):
                 # belongs in front of it, not inside it. Without this the only thing standing
                 # between a repeated plan and a repeated 500 s copy was a state assignment that an
                 # exception could skip, which is exactly what happened (4s.32).
-                if data_source == self._data_source:
+                # `_data_source` IS CREATED ON THE SUCCESS PATH BELOW, so on the first call it
+                # does not exist yet. Reading it unguarded here raised
+                # `'DLIOBenchmark' object has no attribute '_data_source'` on EVERY call of
+                # `cf_fz_loop_n32_r1d`, 17,920 times, and the resolver never ran: the guard added to
+                # stop a second copy stopped the first one (T3-0 4s.33). Every other reader in this
+                # file uses `getattr(self, "_data_source", "pfs")`, and so does this one now.
+                _current_ds = getattr(self, "_data_source", "pfs")
+                if data_source == _current_ds:
                     self.logger.output(
-                        f"{utcnow()} data_source ack: {self._data_source} -> {data_source} "
+                        f"{utcnow()} data_source ack: {_current_ds} -> {data_source} "
                         f"reason=no_move_needed applied=False completed_at=None "
                         f"files={len(self.args.file_list_train)} "
                         f"data_folder={self.args.data_folder}")
@@ -685,7 +709,7 @@ class DLIOBenchmark(object):
                 # state the paper can describe. The resolver returning no file list is the actual
                 # outcome, so it is said out loud and stamped on the knob's own reported state.
                 _reason = ("relocated" if _new else
-                           ("no_move_needed" if data_source == self._data_source
+                           ("no_move_needed" if data_source == _current_ds
                             else "resolver_declined"))
                 # WHEN THE COPY FINISHED, which only this component knows (T3-0 4s.31). The
                 # resolver is synchronous, so the moment it returns the relocation is complete and
@@ -711,7 +735,7 @@ class DLIOBenchmark(object):
                 self._data_source_applied = (_reason == "relocated")
                 self._data_source_completed_at = _completed_s
                 self.logger.output(
-                    f"{utcnow()} data_source ack: {self._data_source} -> {data_source} "
+                    f"{utcnow()} data_source ack: {_current_ds} -> {data_source} "
                     f"reason={_reason} applied={_reason == 'relocated'} "
                     f"completed_at={_completed_s} files={len(_new) if _new else 0} "
                     f"data_folder={self.args.data_folder}")
