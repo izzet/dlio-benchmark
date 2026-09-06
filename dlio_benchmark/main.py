@@ -658,9 +658,25 @@ class DLIOBenchmark(object):
                         f"{_ctx.per_step_compute:.5f}s compute, {_ctx.epochs_remaining} epochs "
                         f"remaining, {_ctx.nnodes} nodes x {_ctx.ppn} ranks")
                 _new = _resolve(data_source, list(self.args.file_list_train), _ctx)
+                # THE ACTUATOR'S OWN REASON, RECORDED (T3-0 4s.30).
+                #
+                # `cf_fz_loop_n32_r1b` published `data_source local -> pfs` on all 32 agents, every
+                # ack came back `applied`, and NOTHING MOVED: the run kept the staged speed and the
+                # shards were released only at exit. A revert that changes nothing was
+                # indistinguishable in the record from one that was carried out, which is not a
+                # state the paper can describe. The resolver returning no file list is the actual
+                # outcome, so it is said out loud and stamped on the knob's own reported state.
+                _reason = ("relocated" if _new else
+                           ("no_move_needed" if data_source == self._data_source
+                            else "resolver_declined"))
                 if _new:
                     self.args.file_list_train = _new
                     self.args.data_folder = os.path.dirname(os.path.dirname(_new[0]))
+                self.logger.output(
+                    f"{utcnow()} data_source ack: {self._data_source} -> {data_source} "
+                    f"reason={_reason} files={len(_new) if _new else 0} "
+                    f"data_folder={self.args.data_folder}")
+                self._data_source_reason = _reason
                 self._data_source = data_source
             except Exception as e:
                 self.logger.output(f"{utcnow()} data_source resolve unavailable: {e}")
