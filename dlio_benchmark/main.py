@@ -15,6 +15,7 @@
    limitations under the License.
 """
 import os
+import time
 import math
 import sys
 from time import time, perf_counter
@@ -669,14 +670,26 @@ class DLIOBenchmark(object):
                 _reason = ("relocated" if _new else
                            ("no_move_needed" if data_source == self._data_source
                             else "resolver_declined"))
+                # WHEN THE COPY FINISHED, which only this component knows (T3-0 4s.31). The
+                # resolver is synchronous, so the moment it returns the relocation is complete and
+                # `_t_reloc` is the wall it took. The planner needs this because the copy's own
+                # windows are neither the old regime nor the new one: sampling the moved arm from
+                # the plan instead of from here is what reverted a decision that beat its own
+                # prediction by 2.7x (4s.30).
+                _completed_s = time.time() if _reason == "relocated" else None
                 if _new:
                     self.args.file_list_train = _new
                     self.args.data_folder = os.path.dirname(os.path.dirname(_new[0]))
                 self.logger.output(
                     f"{utcnow()} data_source ack: {self._data_source} -> {data_source} "
-                    f"reason={_reason} files={len(_new) if _new else 0} "
+                    f"reason={_reason} applied={_reason == 'relocated'} "
+                    f"completed_at={_completed_s} files={len(_new) if _new else 0} "
                     f"data_folder={self.args.data_folder}")
                 self._data_source_reason = _reason
+                # AN ACK WHOSE REASON IS NOT `relocated` IS NOT AN APPLICATION. Reporting a no-op as
+                # applied is how the planner booked a revert that moved nothing (4s.30).
+                self._data_source_applied = (_reason == "relocated")
+                self._data_source_completed_at = _completed_s
                 self._data_source = data_source
             except Exception as e:
                 self.logger.output(f"{utcnow()} data_source resolve unavailable: {e}")
