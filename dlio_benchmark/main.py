@@ -15,7 +15,6 @@
    limitations under the License.
 """
 import os
-import time
 import math
 import sys
 from time import time, perf_counter
@@ -124,6 +123,10 @@ class _NullStepDirect:
 
 
 _NULL_STEP_DIRECT = _NullStepDirect()
+
+
+class _AlreadyApplied(Exception):
+    """This node already holds the requested data_source; do not resolve again."""
 
 
 class DLIOBenchmark(object):
@@ -658,6 +661,20 @@ class DLIOBenchmark(object):
                         f"{_ctx.epoch_seconds:.2f}s, {_ctx.steps} steps x "
                         f"{_ctx.per_step_compute:.5f}s compute, {_ctx.epochs_remaining} epochs "
                         f"remaining, {_ctx.nnodes} nodes x {_ctx.ppn} ranks")
+                # IDEMPOTENT BY CONSTRUCTION. A shard already committed on this node is not
+                # copied again, whatever asks: the resolver is the expensive path and the guard
+                # belongs in front of it, not inside it. Without this the only thing standing
+                # between a repeated plan and a repeated 500 s copy was a state assignment that an
+                # exception could skip, which is exactly what happened (4s.32).
+                if data_source == self._data_source:
+                    self.logger.output(
+                        f"{utcnow()} data_source ack: {self._data_source} -> {data_source} "
+                        f"reason=no_move_needed applied=False completed_at=None "
+                        f"files={len(self.args.file_list_train)} "
+                        f"data_folder={self.args.data_folder}")
+                    self._data_source_reason = "no_move_needed"
+                    self._data_source_applied = False
+                    raise _AlreadyApplied()
                 _new = _resolve(data_source, list(self.args.file_list_train), _ctx)
                 # THE ACTUATOR'S OWN REASON, RECORDED (T3-0 4s.30).
                 #
@@ -676,21 +693,30 @@ class DLIOBenchmark(object):
                 # windows are neither the old regime nor the new one: sampling the moved arm from
                 # the plan instead of from here is what reverted a decision that beat its own
                 # prediction by 2.7x (4s.30).
-                _completed_s = time.time() if _reason == "relocated" else None
+                # `time` IS THE FUNCTION HERE, not the module: line 21 rebinds it with
+                # `from time import time`. Writing `time.time()` raised
+                # `'builtin_function_or_method' object has no attribute 'time'` on every
+                # application, and because it raised AFTER the copy had already run and BEFORE the
+                # state below was assigned, the shard was copied and then forgotten: DLIO kept the
+                # PFS file list and the next make_loader resolved again. That is the 160 copies of
+                # `cf_fz_loop_n32_r1c`, five per node, and no epoch ever finished (T3-0 4s.32).
+                _completed_s = time() if _reason == "relocated" else None
+                # STATE FIRST, LOGGING AFTER. The copy is the expensive, irreversible part; once it
+                # has happened nothing later in this block may be allowed to lose the fact.
                 if _new:
                     self.args.file_list_train = _new
                     self.args.data_folder = os.path.dirname(os.path.dirname(_new[0]))
+                self._data_source = data_source
+                self._data_source_reason = _reason
+                self._data_source_applied = (_reason == "relocated")
+                self._data_source_completed_at = _completed_s
                 self.logger.output(
                     f"{utcnow()} data_source ack: {self._data_source} -> {data_source} "
                     f"reason={_reason} applied={_reason == 'relocated'} "
                     f"completed_at={_completed_s} files={len(_new) if _new else 0} "
                     f"data_folder={self.args.data_folder}")
-                self._data_source_reason = _reason
-                # AN ACK WHOSE REASON IS NOT `relocated` IS NOT AN APPLICATION. Reporting a no-op as
-                # applied is how the planner booked a revert that moved nothing (4s.30).
-                self._data_source_applied = (_reason == "relocated")
-                self._data_source_completed_at = _completed_s
-                self._data_source = data_source
+            except _AlreadyApplied:
+                pass
             except Exception as e:
                 self.logger.output(f"{utcnow()} data_source resolve unavailable: {e}")
 
