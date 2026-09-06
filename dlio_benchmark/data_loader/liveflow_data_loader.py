@@ -111,30 +111,87 @@ def get_gate():
     return _GATE
 
 
-def _make_gate(limit, max_limit):
-    """Create the process-wide gate. MUST run before any worker is forked.
+def _gate_enabled():
+    return os.environ.get("LIVEFLOW_GATE", "1") == "1"
 
-    Building it lazily inside a worker would give each worker a private copy, and the gate would
-    silently throttle nothing -- the failure mode that motivated `_DECODE_LIMIT` being created at
-    import time rather than on first use.
+
+def _build_gate_at_import():
+    """Create the gate WHEN THIS MODULE IS IMPORTED, which is before any worker is forked.
+
+    THE DEFECT THIS REMOVES (T3-0 4s.25, 4s.26). The gate was created on the first `make_loader`
+    call, which under the pool-once policy of 6cc2b5c happens on whichever epoch first builds the
+    pool. A worker forked by that pool inherits whatever `_GATE` held at ITS fork, and every later
+    loader object adopts the pool without re-establishing anything -- so a worker can hold `None`,
+    read ungated through `__getitem__`'s first branch, or hold a private copy that admits itself
+    every time. Measured on dev2: mean instantaneous read concurrency 56.0 and peak 64 on a node
+    whose four per-rank gates were set to `limit=1`, a ceiling of 4.
+
+    The module's own docstring for the old function already named this ("would silently throttle
+    nothing") and prescribed the cure: build it at import time, as `_DECODE_LIMIT` is. That is what
+    this does. The limit and max are configured later through `set_limit` on the SAME object, which
+    is an `mp.Value` in shared memory, so a change from any loader in any epoch reaches every worker
+    that ever forked from this process.
+
+    `LIVEFLOW_GATE=0` still creates no gate at all, and remains the only ungated path.
     """
     global _GATE
-    if _GATE is None:
-        import sys
+    if _GATE is not None or not _gate_enabled():
+        return _GATE
+    try:
+        import sys as _sys
         p = os.environ.get("LIVEFLOW_SHM_PYTHONPATH")
-        if p and p not in sys.path:
-            sys.path.insert(0, p)
+        if p and p not in _sys.path:
+            _sys.path.insert(0, p)
         from shm_gate import ShmGate
-        _GATE = ShmGate(limit=limit, max_limit=max_limit)
+        # Built WIDE OPEN at the eventual pool width, so importing the module throttles nothing on
+        # its own; `_make_gate` narrows it to the arm's read_threads before the pool is built.
+        mx = max(1, int(os.environ.get("LIVEFLOW_MAX_READ_THREADS", "8") or 8))
+        _GATE = ShmGate(limit=mx, max_limit=mx)
+    except Exception as exc:                                    # noqa: BLE001
+        _mark("GATE IMPORT FAILED: %s  (set LIVEFLOW_GATE=0 to run ungated on purpose)" % exc)
+        _GATE = None
     return _GATE
+
+
+def _make_gate(limit, max_limit):
+    """Narrow the import-time gate to this arm's limit. Never creates one after a fork.
+
+    Kept as the call site the loader already had, so the build path reads the same; what changed is
+    that it no longer CONSTRUCTS the gate, because by the time it runs a worker may already exist.
+    """
+    g = _GATE if _GATE is not None else _build_gate_at_import()
+    if g is not None and max_limit:
+        g._max = int(max_limit)
+    return g
 
 
 class GatedTorchDataset(TorchDataset):
     """TorchDataset whose read is bounded by the shared gate."""
 
+    _PROBED = False
+
     def __getitem__(self, image_idx):
         gate = get_gate()
+        # THE WORKER PROBE, once per process, permanently. 4s.25 could not decide between "the
+        # worker has no gate" and "the worker has a private one" because nothing in any artefact
+        # recorded either. One line at the first fetch answers it for every future run.
+        if not GatedTorchDataset._PROBED:
+            GatedTorchDataset._PROBED = True
+            _mark("GATE PROBE pid=%d gate=%s id=%s limit=%s max=%s"
+                  % (os.getpid(), "none" if gate is None else "present",
+                     "n/a" if gate is None else hex(id(gate)),
+                     "n/a" if gate is None else gate.limit,
+                     "n/a" if gate is None else getattr(gate, "_max", "n/a")))
         if gate is None:
+            # A CONFIGURED GATE THAT A WORKER CANNOT SEE IS THE DEFECT, NOT A FALLBACK. Reading
+            # ungated here is what made `limit=1` mean 56 concurrent readers while GATE STATS
+            # looked alive. LIVEFLOW_GATE=0 is the only way to run without one, and it is checked
+            # rather than inferred.
+            if _gate_enabled():
+                raise RuntimeError(
+                    "LiveFlow gate is enabled but this worker (pid %d) has none. The gate must be "
+                    "built at import time, before any fork. Set LIVEFLOW_GATE=0 to run ungated on "
+                    "purpose." % os.getpid())
             return super().__getitem__(image_idx)
         # Explicit token rather than `with gate:`. The context-manager form has to stash whether
         # it actually acquired (the gate has a bypass fast path when the limit cannot bind), and
@@ -568,3 +625,7 @@ class LiveFlowDataLoader(BaseDataLoader):
                   % (st["limit"], st["waits"], st["wait_ms"],
                      "(gate never blocked -- limit did not bind)" if st["waits"] == 0
                      else "(gate blocked workers -- throttling was real)"))
+
+
+# Built at import, before any worker can be forked. See _build_gate_at_import.
+_build_gate_at_import()
