@@ -935,9 +935,10 @@ class DLIOBenchmark(object):
             except StopIteration:
                 dft_ai.pipeline.step.stop(metadata=True)
                 if self._window is not None:
-                    if self._window_will_close():
-                        self._emit_loader_stall(loader, epoch, overall_step)
-                    self._window.stop()
+                    # ``window.start`` precedes next() so fetch time remains inside the
+                    # measurement.  At end-of-input that start has no completed training step;
+                    # pair it for tracker ordering but explicitly exclude it from control.
+                    self._window.discard()
                 break
             # Check if max steps reached to prevent incomplete fetch/compute pairs
             if overall_step > max_steps or ((self.total_training_steps > 0) and (overall_step > self.total_training_steps)):
