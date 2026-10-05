@@ -63,7 +63,7 @@ class TFDataLoader(BaseDataLoader):
         self._consumer_boundary = None
 
     @dlp.log
-    def read(self, read_threads=None, prefetch_size=None):
+    def read(self, read_threads=None, prefetch_size=None, resume_batches=0):
         if read_threads is None:
             read_threads = self._args.read_threads
         if prefetch_size is None:
@@ -98,7 +98,8 @@ class TFDataLoader(BaseDataLoader):
                                           thread_index=-1,
                                           epoch_number=self.epoch_number).next(
                                               read_threads=read_threads,
-                                              prefetch_size=prefetch_size)
+                                              prefetch_size=prefetch_size,
+                                              resume_batches=resume_batches)
 
     @dlp.log
     def next(self):

@@ -19,7 +19,7 @@ import os
 import sys
 
 from dlio_benchmark.common.constants import MODULE_DATA_READER
-from dlio_benchmark.utils.utility import utcnow, Profile, maybe_inject_fetch_delay
+from dlio_benchmark.utils.utility import utcnow, Profile, maybe_inject_fetch_delay, dft_ai
 from dlio_benchmark.common.enumerations import Shuffle
 from dlio_benchmark.reader.reader_handler import FormatReader
 import tensorflow as tf
@@ -67,7 +67,10 @@ class TFReader(FormatReader):
                 'image': tf.io.FixedLenFeature([], tf.string),
                 'size': tf.io.FixedLenFeature([], tf.int64)
             }
-        parsed_example = tf.io.parse_example(serialized=serialized, features=features)
+        # Decode-family service-time region (analyzer layer `reader_decode`: cat "data", name
+        # "decode").  Emitted for every arm alike whenever tracing is on; it changes no data.
+        with dft_ai.data.derive("decode"):
+            parsed_example = tf.io.parse_example(serialized=serialized, features=features)
         # Get the image as raw bytes.
         #image_raw = parsed_example['image']
         #dimension = tf.cast(parsed_example['size'], tf.int32).numpy()
@@ -79,8 +82,28 @@ class TFReader(FormatReader):
         #resized_image = tf.convert_to_tensor(self._args.resized_image, dtype=tf.uint8)
         return self._resized_image
 
+    @staticmethod
+    def _local_batch_total(file_count, samples_per_file, comm_size, rank, batch_size):
+        """Exact post-shard, full-batch cardinality for one TF rank.
+
+        TFReader shards files when possible and records otherwise.  The cursor
+        for a rebuilt iterator must use that rank-local cardinality, never a
+        global average that happens to work only for divisible file layouts.
+        """
+        if min(file_count, samples_per_file, comm_size, batch_size) < 1:
+            raise ValueError("TF shard dimensions must be positive")
+        if not 0 <= rank < comm_size:
+            raise ValueError("rank must be within communicator")
+        if file_count >= comm_size:
+            local_files = (file_count - rank + comm_size - 1) // comm_size if rank < file_count else 0
+            local_samples = local_files * samples_per_file
+        else:
+            all_samples = file_count * samples_per_file
+            local_samples = (all_samples - rank + comm_size - 1) // comm_size if rank < all_samples else 0
+        return local_samples // batch_size
+
     @dlp.log
-    def next(self, read_threads=None, prefetch_size=None):
+    def next(self, read_threads=None, prefetch_size=None, resume_batches=0):
         if read_threads is None:
             read_threads = self._args.read_threads
         if prefetch_size is None:
@@ -94,6 +117,8 @@ class TFReader(FormatReader):
         # itself is an iterator
         if len(self._file_list) == 0:
             return []
+        if not isinstance(resume_batches, int) or resume_batches < 0:
+            raise ValueError("resume_batches must be a non-negative integer")
 
         # LiveIO: true tf.data.AUTOTUNE arm, gated by env var so it never affects
         # the fixed-read_threads sweep runs. When on, tf.data picks read/map/prefetch
@@ -145,10 +170,18 @@ class TFReader(FormatReader):
                 lambda x: tf.py_function(func=self._parse_image, inp=[x], Tout=[tf.uint8]),
                 num_parallel_calls=_num_parallel_calls)
 
-        self._dataset = self._dataset.repeat()
-        total = math.floor(len(self._file_list)/self._args.comm_size / self.batch_size * self._args.num_samples_per_file)
-
-        return self._dataset.take(total*self._args.epochs).prefetch(buffer_size=_prefetch_buffer)
+        total = self._local_batch_total(
+            len(self._file_list), self._args.num_samples_per_file,
+            self._args.comm_size, self._args.my_rank, self.batch_size)
+        if resume_batches > total:
+            raise ValueError("resume_batches exceeds this rank's epoch batch count")
+        # A changed TF read_threads setting creates a new tf.data pipeline. At
+        # a native window boundary the caller supplies batches already consumed
+        # from this rank's deterministic shard, so resume after that prefix
+        # rather than silently replaying it. The outer DLIO epoch loop owns the
+        # epoch limit; this reader therefore exposes only its remaining epoch.
+        self._dataset = self._dataset.repeat().skip(resume_batches).take(total - resume_batches)
+        return self._dataset.prefetch(buffer_size=_prefetch_buffer)
     
     @dlp.log
     def read_index(self, image_idx, step):

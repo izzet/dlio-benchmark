@@ -34,7 +34,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 from dlio_benchmark.checkpointing.checkpointing_factory import CheckpointingFactory
 from dlio_benchmark.common.constants import MODULE_DLIO_BENCHMARK
-from dlio_benchmark.common.enumerations import DatasetType, MetadataType
+from dlio_benchmark.common.enumerations import DataLoaderType, DatasetType, MetadataType
 from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai, DLIOLogger
 from dlio_benchmark.utils.statscounter import StatsCounter
 from dlio_benchmark.utils.config import LoadConfig, ConfigArguments, GetConfig
@@ -393,6 +393,7 @@ class DLIOBenchmark(object):
         self._cached_loader = None
         self._cached_prefetch = None
         self._cached_read_threads = None
+        self._cached_computation_threads = None
         # Which epoch the cached loader was BUILT for. Reusing a loader across an epoch boundary is
         # unsound on the TF path: tf_data_loader.read() bakes epoch_number into the dataset (the
         # from_generator interleave at tf_data_loader.py:85,97) while next() increments it, so a
@@ -466,6 +467,7 @@ class DLIOBenchmark(object):
                     current_values={
                         "prefetch_size": self.args.prefetch_size,
                         "read_threads": self.args.read_threads,
+                        "computation_threads": self.args.computation_threads,
                     },
                 )
                 self._emit_optimizer_debug("optimizer_knobs_preregistered")
@@ -629,7 +631,8 @@ class DLIOBenchmark(object):
         except Exception as e:                                # noqa: BLE001
             self.logger.output(f"{utcnow()} data_source effective ack unavailable: {e}")
 
-    def make_loader(self, epoch, prefetch_size=None, read_threads=None, data_source=None):
+    def make_loader(self, epoch, prefetch_size=None, read_threads=None, data_source=None,
+                    resume_batches=0, computation_threads=None):
         """Create or reuse a training DataLoader for the given epoch.
 
         When prefetch_size and read_threads are unchanged from the previous
@@ -645,6 +648,11 @@ class DLIOBenchmark(object):
             prefetch_size = self.args.prefetch_size
         if read_threads is None:
             read_threads = self.args.read_threads
+        # Decode parallelism (`num_parallel_calls` of the TF decode map).  Injected by @tunable like
+        # every other knob, but only when DFOPTIMIZER_REGISTER_COMPUTATION_THREADS=1 registers it;
+        # otherwise it is the workload's own value and never changes.
+        if computation_threads is None:
+            computation_threads = self.args.computation_threads
         # data_source arrives like every other knob -- injected by @tunable from a plan off the SHM
         # mailbox. What satisfying a value COSTS is not the application's business: resolvers are
         # registered elsewhere, so adding a data-location actuator ("replica", "compressed",
@@ -795,12 +803,13 @@ class DLIOBenchmark(object):
 
         # Broadcast knob values from local rank 0 so per-node optimizers can
         # tune different nodes independently.
-        knobs = [prefetch_size, read_threads]
+        knobs = [prefetch_size, read_threads, computation_threads]
         knobs = self.local_comm.bcast(knobs, root=0)
-        prefetch_size, read_threads = knobs
+        prefetch_size, read_threads, computation_threads = knobs
 
         self.args.prefetch_size = prefetch_size
         self.args.read_threads = read_threads
+        self.args.computation_threads = computation_threads
 
         # Reuse cached loader only WITHIN an epoch, and only if knobs haven't changed. Crossing an
         # epoch boundary must rebuild (see _cached_epoch above); line 669's comment already states
@@ -811,6 +820,7 @@ class DLIOBenchmark(object):
             and same_epoch
             and self._cached_prefetch == prefetch_size
             and self._cached_read_threads == read_threads
+            and self._cached_computation_threads == computation_threads
         ):
             if self.my_rank == 0:
                 self.logger.output(
@@ -829,6 +839,7 @@ class DLIOBenchmark(object):
                 read_threads=read_threads, prefetch_size=prefetch_size)
             self._cached_prefetch = prefetch_size
             self._cached_read_threads = read_threads
+            self._cached_computation_threads = computation_threads
             self._cached_epoch = epoch
             if self.my_rank == 0:
                 self.logger.output(
@@ -851,7 +862,11 @@ class DLIOBenchmark(object):
                     f" threads={read_threads} (new)"
                 )
             loader = self.framework.get_loader(dataset_type=DatasetType.TRAIN, epoch=epoch)
-            loader.read(read_threads=read_threads, prefetch_size=prefetch_size)
+            if getattr(loader, "data_loader_type", None) == DataLoaderType.TENSORFLOW:
+                loader.read(read_threads=read_threads, prefetch_size=prefetch_size,
+                            resume_batches=resume_batches)
+            else:
+                loader.read(read_threads=read_threads, prefetch_size=prefetch_size)
             # THE MOMENT THE NEW SOURCE IS IN USE. `get_loader` reads `args.file_list_train`, so
             # this build is where a relocation stops being a resolved path and starts being the
             # bytes the workload reads. The cached and reconfigured branches above return a loader
@@ -860,6 +875,7 @@ class DLIOBenchmark(object):
             self._cached_loader = loader
             self._cached_prefetch = prefetch_size
             self._cached_read_threads = read_threads
+            self._cached_computation_threads = computation_threads
             self._cached_epoch = epoch
 
         self._ensure_optimizer_runtime_started()
@@ -922,6 +938,21 @@ class DLIOBenchmark(object):
         while True:
             _step_t0 = perf_counter()
             direct.begin()
+            # `overall_step` is an authoritative workload bound.  Do not open
+            # a fresh native control window merely to call next() and discover
+            # the already-known end of this epoch: that emitted a discarded
+            # window, advanced the global window identity, and made the
+            # declared windows-per-epoch horizon arithmetically false.  An
+            # unexpectedly short loader still takes the StopIteration/discard
+            # path below, where the non-actionable boundary remains useful.
+            if overall_step > max_steps or (
+                    self.total_training_steps > 0
+                    and overall_step > self.total_training_steps):
+                if self.args.my_rank == 0:
+                    self.logger.info(f"{utcnow()} Maximum number of steps reached")
+                if (block_step != 1 and self.do_checkpoint) or (not self.do_checkpoint):
+                    self.stats.end_block(epoch, block, block_step - 1)
+                break
             dft_ai.update(epoch=epoch, step=overall_step, args={"max_steps": max_steps})
             # Window boundary (gated by every_n) — replaces pipeline.step
             # control events. Only emits to Mofka at cadence boundaries.
@@ -939,18 +970,6 @@ class DLIOBenchmark(object):
                     # measurement.  At end-of-input that start has no completed training step;
                     # pair it for tracker ordering but explicitly exclude it from control.
                     self._window.discard()
-                break
-            # Check if max steps reached to prevent incomplete fetch/compute pairs
-            if overall_step > max_steps or ((self.total_training_steps > 0) and (overall_step > self.total_training_steps)):
-                if self.args.my_rank == 0:
-                    self.logger.info(f"{utcnow()} Maximum number of steps reached")
-                if (block_step != 1 and self.do_checkpoint) or (not self.do_checkpoint):
-                    self.stats.end_block(epoch, block, block_step - 1)
-                dft_ai.pipeline.step.stop(metadata=True)
-                if self._window is not None:
-                    if self._window_will_close():
-                        self._emit_loader_stall(loader, epoch, overall_step)
-                    self._window.stop()
                 break
             direct.mark("next")
             self.stats.batch_loaded(epoch, overall_step, block)
@@ -1051,6 +1070,9 @@ class DLIOBenchmark(object):
                         # was rejected with knob_not_in_kwargs -- 7 times in one run -- and the
                         # actuator could never fire however cheap or correct the plan was.
                         data_source=getattr(self, "_data_source", "pfs"),
+                        # The completed step is the deterministic rank-shard
+                        # prefix. A new TF loader must resume after it.
+                        resume_batches=overall_step,
                         _apply_at="window_boundary",
                     )
                     if new_loader is not loader:
@@ -1133,7 +1155,7 @@ class DLIOBenchmark(object):
             # steps_per_epoch // 10 gives ~10 windows per epoch on any workload, which is the
             # quantity that actually matters: enough windows for the sample floor to be reachable,
             # few enough that the analyzer keeps up.
-            _default_every_n = max(1, _steps_per_epoch // 10)
+            _default_every_n = 20
             _initial_every_n = int(os.environ.get(
                 "DLIO_WINDOW_EVERY_N", _default_every_n
             ))

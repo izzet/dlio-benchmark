@@ -16,6 +16,12 @@
 """
 import math
 import pickle
+import hashlib
+import json
+import os
+import socket
+import tempfile
+from pathlib import Path
 import torch
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.sampler import Sampler
@@ -29,6 +35,49 @@ from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai
 from dlio_benchmark.utils.config import ConfigArguments
 
 dlp = Profile(MODULE_DATA_LOADER)
+
+_WORKER_ROSTER_SCHEMA = "dlio-worker-posix-roster.v1"
+
+
+def _publish_worker_roster(worker_id, expected_workers):
+    """Opt-in, worker-owned identity evidence independent of SHM trace ownership."""
+    if os.environ.get("DLIO_WORKER_POSIX_ROSTER", "0") != "1":
+        return
+    info = torch.utils.data.get_worker_info()
+    if info is None or info.id != worker_id or info.num_workers != expected_workers:
+        raise RuntimeError("worker roster callback is not running in its assigned DataLoader worker")
+    directory = Path(os.environ.get("DLIO_WORKER_POSIX_ROSTER_DIR", ""))
+    prefix = os.environ.get("DFTRACER_SHM_PREFIX", "")
+    if (not directory.is_absolute() or not directory.is_dir() or not prefix
+            or prefix != os.environ.get("LIVEFLOW_SHM_PREFIX")):
+        raise RuntimeError("worker roster requires an existing absolute directory and matching SHM prefixes")
+    rank = ConfigArguments.get_instance().my_rank
+    if type(rank) is not int or rank < 0 or expected_workers < 1:
+        raise RuntimeError("invalid DLIO worker roster rank or worker count")
+    digest = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:16]
+    destination = directory / f"{_WORKER_ROSTER_SCHEMA}.{digest}.rank-{rank}.worker-{worker_id}.json"
+    record = {
+        "schema_version": _WORKER_ROSTER_SCHEMA,
+        "run_prefix": prefix,
+        "host": socket.gethostname(),
+        "rank": rank,
+        "worker_id": worker_id,
+        "pid": os.getpid(),
+        "expected_workers": expected_workers,
+    }
+    fd, temporary = tempfile.mkstemp(prefix=".dlio-worker-roster-", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as exc:
+            raise RuntimeError(f"worker roster destination already exists: {destination}") from exc
+    finally:
+        os.unlink(temporary)
 
 
 class TorchDataset(Dataset):
@@ -46,6 +95,7 @@ class TorchDataset(Dataset):
         self.reader = None
         self.num_images_read = 0
         self.batch_size = batch_size
+        self.num_workers = num_workers
         args = ConfigArguments.get_instance()
         self.serial_args = pickle.dumps(args)
         self.logger = args.logger
@@ -64,6 +114,8 @@ class TorchDataset(Dataset):
                                                dataset_type=self.dataset_type,
                                                thread_index=worker_id,
                                                epoch_number=self.epoch_number)
+        if self.num_workers > 0:
+            _publish_worker_roster(worker_id, self.num_workers)
 
     def __del__(self):
         if self.dlp_logger:
