@@ -148,9 +148,18 @@ def test_applied_vector_snapshot_and_apply_cost():
     bench._window._completed_steps = 3000
     bench.args.read_threads = 8
     pub(bench, 0.2)
-    assert calls[-1] == ({"prefetch_size": 2, "read_threads": 8, "computation_threads": 1}, 3001, 0.2)
+    assert calls[-1] == ({"prefetch_size": 2, "read_threads": 8, "computation_threads": 1}, 3001, 0.2)  # no local_comm: value unchanged
     refine(bench)                    # the probe measured the step after the apply
     assert calls[-1][2] == 0.7 and calls[-1][1] == 3001
     n = len(calls)
     refine(bench)
     assert len(calls) == n           # probe consumed
+
+
+def test_node_max_is_the_worst_rank_and_identical_everywhere():
+    class Local:
+        def __init__(self, vals): self.vals = vals
+        def Get_size(self): return len(self.vals)
+        def allreduce(self, v, op): return op(self.vals)
+    assert job_input.node_max(Local([0.1, 0.4, 0.2, 0.3]), 0.1) == 0.4
+    assert job_input.node_max(None, 0.25) == 0.25

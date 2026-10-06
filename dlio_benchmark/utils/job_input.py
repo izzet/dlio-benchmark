@@ -78,3 +78,13 @@ def sync_window(comm, loader, window, epoch, step, tracer):
         critical, own, n_valid = reduce_window(comm, steps, k, MPI.MAX, MPI.SUM)
     emit(tracer, epoch, step, critical, own, n_valid)
     return critical, own
+
+
+def node_max(comm, value):
+    """Worst value over the node's ranks (they reach every window boundary together, make_loader's bcast already
+    makes the boundary a node-local collective).  The analyzer requires the ranks of a node to publish an identical
+    applied vector, apply cost included; a rank-local latency would make the whole vector discordant and the planner
+    would receive nothing."""
+    if comm is None or int(comm.Get_size()) <= 1:
+        return value
+    return comm.allreduce(value, op=max)

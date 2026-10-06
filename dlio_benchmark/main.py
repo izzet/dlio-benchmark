@@ -936,10 +936,10 @@ class DLIOBenchmark(object):
             return
         self._phys_vec = vec
         self._phys_applied_step = 0 if prev is None else int(getattr(window, "_completed_steps", 0)) + 1
-        window.set_physical_config(vec, self._phys_applied_step,
-                                   apply_cost_s=None if prev is None else latency_s)
+        cost = None if prev is None else job_input.node_max(getattr(self, "local_comm", None), float(latency_s or 0.0))
+        window.set_physical_config(vec, self._phys_applied_step, apply_cost_s=cost)
         if prev is not None and hasattr(window, "begin_apply_probe"):
-            window.begin_apply_probe(float(latency_s or 0.0))
+            window.begin_apply_probe(float(cost or 0.0))
 
     def _refine_apply_cost(self):
         """One window after an apply: the stall its next step actually saw, into the applied-vector snapshot."""
@@ -949,7 +949,8 @@ class DLIOBenchmark(object):
         cost = window.apply_probe_result()
         if cost is None or getattr(self, "_phys_vec", None) is None:
             return
-        window.set_physical_config(self._phys_vec, self._phys_applied_step, apply_cost_s=float(cost))
+        cost = job_input.node_max(getattr(self, "local_comm", None), float(cost))
+        window.set_physical_config(self._phys_vec, self._phys_applied_step, apply_cost_s=cost)
 
     def _job_input_sync(self, loader, epoch, step):
         """Job-level critical-path input exposure for the window about to close (opt-in).
