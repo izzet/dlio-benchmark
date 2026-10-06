@@ -119,6 +119,9 @@ class TFDataLoader(BaseDataLoader):
             return 0.0
         return self._consumer_boundary.emit_window_stall(epoch, step)
 
+    def last_step_wait_s(self):
+        return None if self._consumer_boundary is None else self._consumer_boundary.last_wait_seconds
+
     def drain_step_stalls(self):
         if self._consumer_boundary is None:
             return []

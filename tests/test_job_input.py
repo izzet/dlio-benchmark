@@ -163,3 +163,31 @@ def test_node_max_is_the_worst_rank_and_identical_everywhere():
         def allreduce(self, v, op): return op(self.vals)
     assert job_input.node_max(Local([0.1, 0.4, 0.2, 0.3]), 0.1) == 0.4
     assert job_input.node_max(None, 0.25) == 0.25
+
+
+def test_reduced_per_step_vector_reaches_the_window_series():
+    """The job-wide per-step maximum wait (what every rank holds after the Allreduce) is the planner's job-level
+    critical-path input series; sync_window hands it to Window.set_window_series."""
+    per_rank = [[0.0, 0.5, 0.0, 0.0], [0.0, 0.0, 0.3, 0.0], [0.2, 0.0, 0.0, 0.0]]
+
+    class _Window:
+        pending_steps = 4
+        series = {}
+
+        def set_window_series(self, name, values):
+            self.series[name] = list(values)
+
+    class _Loader:
+        def drain_step_stalls(self):
+            return per_rank[0]
+
+    import sys
+    import types
+    fake_mpi = types.SimpleNamespace(MAX="max", SUM="sum")
+    sys.modules["mpi4py"] = types.SimpleNamespace(MPI=fake_mpi)
+    try:
+        win = _Window()
+        job_input.sync_window(_FakeWorld(per_rank), _Loader(), win, 1, 4, _Tracer())
+    finally:
+        del sys.modules["mpi4py"]
+    assert win.series["job_input"] == [0.2, 0.5, 0.3, 0.0]

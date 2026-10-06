@@ -47,6 +47,7 @@ def reduce_window(comm, steps, window_steps, op_max, op_sum):
     own_sum = np.empty_like(own)
     comm.Allreduce(own, own_sum, op=op_sum)
     size = max(int(comm.Get_size()), 1)
+    reduce_window.last_vector = out[:k].tolist()        # the job-wide per-step maximum wait, every rank holds it
     return float(out[:k].sum()), float(own_sum[0]) / size, int(out[k])
 
 
@@ -77,6 +78,9 @@ def sync_window(comm, loader, window, epoch, step, tracer):
         from mpi4py import MPI
         critical, own, n_valid = reduce_window(comm, steps, k, MPI.MAX, MPI.SUM)
     emit(tracer, epoch, step, critical, own, n_valid)
+    vec = list(steps) if (comm is None or int(comm.Get_size()) <= 1) else getattr(reduce_window, "last_vector", None)
+    if vec is not None and hasattr(window, "set_window_series"):
+        window.set_window_series("job_input", vec)       # per-step critical-path input for the planner's verification
     return critical, own
 
 

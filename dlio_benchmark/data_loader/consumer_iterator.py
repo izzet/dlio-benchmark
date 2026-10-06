@@ -33,8 +33,10 @@ class ConsumerBoundary:
         self._steps = 0
         # Per-step fetch waits of the open window, kept only for the job-level input sync
         # (LIVEFLOW_JOB_INPUT_SYNC=1) so a default run holds no list.
-        self._record_steps = os.environ.get("LIVEFLOW_JOB_INPUT_SYNC", "0") == "1"
+        self._record_steps = (os.environ.get("LIVEFLOW_JOB_INPUT_SYNC", "0") == "1"
+                              or os.environ.get("LIVEFLOW_PRESET") == "liveflow-v1")
         self._window_step_waits = []
+        self._last_wait_s = 0.0
 
     def next_batch(self):
         """Return one batch while timing exactly ``next(source_iterator)``."""
@@ -50,6 +52,7 @@ class ConsumerBoundary:
         self._pending_stall_s += elapsed
         self._total_stall_s += elapsed
         self._steps += 1
+        self._last_wait_s = elapsed
         if self._record_steps:
             self._window_step_waits.append(elapsed)
         return batch
@@ -70,6 +73,11 @@ class ConsumerBoundary:
     @property
     def pending_stall_seconds(self):
         return self._pending_stall_s
+
+    @property
+    def last_wait_seconds(self):
+        """The fetch wait of the most recent step (seconds), for the window's per-step exposure series."""
+        return self._last_wait_s
 
     def drain_step_stalls(self):
         """The per-step fetch waits since the last drain (seconds), for the job-level input sync."""
