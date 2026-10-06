@@ -119,6 +119,11 @@ class TFDataLoader(BaseDataLoader):
             return 0.0
         return self._consumer_boundary.emit_window_stall(epoch, step)
 
+    def drain_step_stalls(self):
+        if self._consumer_boundary is None:
+            return []
+        return self._consumer_boundary.drain_step_stalls()
+
     @dlp.log
     def finalize(self):
         pass

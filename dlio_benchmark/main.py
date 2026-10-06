@@ -36,6 +36,7 @@ from dlio_benchmark.checkpointing.checkpointing_factory import CheckpointingFact
 from dlio_benchmark.common.constants import MODULE_DLIO_BENCHMARK
 from dlio_benchmark.common.enumerations import DataLoaderType, DatasetType, MetadataType
 from dlio_benchmark.utils.utility import utcnow, DLIOMPI, Profile, dft_ai, DLIOLogger
+from dlio_benchmark.utils import job_input
 from dlio_benchmark.utils.statscounter import StatsCounter
 from dlio_benchmark.utils.config import LoadConfig, ConfigArguments, GetConfig
 from dlio_benchmark.profiler.profiler_factory import ProfilerFactory
@@ -915,6 +916,18 @@ class DLIOBenchmark(object):
         return 0.0
 
 
+    def _job_input_sync(self, loader, epoch, step):
+        """Job-level critical-path input exposure for the window about to close (opt-in).
+
+        Runs on every rank at the same window boundary, before the stall event and window.stop, so
+        the reduced values are ordered into the window they describe.  See utils/job_input.py.
+        """
+        if not job_input.enabled():
+            return None
+        from dftracer.python import dftracer as PerfTracer
+        return job_input.sync_window(self.comm, loader, self._window, epoch, step,
+                                     PerfTracer.get_instance())
+
     @dft_ai.pipeline.train
     def _train(self, epoch, loader):
         """
@@ -1053,6 +1066,7 @@ class DLIOBenchmark(object):
                 # analyzer drains on window.stop, so emitting it afterwards silently assigns the
                 # storage wait to the next window or loses the final one at epoch end.
                 if self._window_will_close():
+                    self._job_input_sync(loader, epoch, overall_step)
                     self._emit_loader_stall(loader, epoch, overall_step)
                 at_boundary = self._window.stop()
                 direct.mark("window_stop")
@@ -1236,6 +1250,7 @@ class DLIOBenchmark(object):
                 # any accumulated events before the next epoch begins.
                 if self._window is not None:
                     if getattr(self._window, "_active", False):
+                        self._job_input_sync(loader, epoch, steps)
                         self._emit_loader_stall(loader, epoch, steps)
                     self._window.flush()
                 self.logger.debug(f"{utcnow()} Rank {self.my_rank} returned after {steps} steps.")

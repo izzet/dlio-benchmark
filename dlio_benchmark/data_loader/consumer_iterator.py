@@ -1,5 +1,6 @@
 """Trace and account the blocking data-loader consumer boundary."""
 
+import os
 import time
 from contextlib import contextmanager
 
@@ -30,6 +31,10 @@ class ConsumerBoundary:
         self._pending_stall_s = 0.0
         self._total_stall_s = 0.0
         self._steps = 0
+        # Per-step fetch waits of the open window, kept only for the job-level input sync
+        # (LIVEFLOW_JOB_INPUT_SYNC=1) so a default run holds no list.
+        self._record_steps = os.environ.get("LIVEFLOW_JOB_INPUT_SYNC", "0") == "1"
+        self._window_step_waits = []
 
     def next_batch(self):
         """Return one batch while timing exactly ``next(source_iterator)``."""
@@ -45,6 +50,8 @@ class ConsumerBoundary:
         self._pending_stall_s += elapsed
         self._total_stall_s += elapsed
         self._steps += 1
+        if self._record_steps:
+            self._window_step_waits.append(elapsed)
         return batch
 
     @contextmanager
@@ -63,6 +70,12 @@ class ConsumerBoundary:
     @property
     def pending_stall_seconds(self):
         return self._pending_stall_s
+
+    def drain_step_stalls(self):
+        """The per-step fetch waits since the last drain (seconds), for the job-level input sync."""
+        waits = self._window_step_waits
+        self._window_step_waits = []
+        return waits
 
     def drain_stall_seconds(self):
         stalled = self._pending_stall_s
