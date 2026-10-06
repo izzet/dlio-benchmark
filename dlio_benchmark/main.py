@@ -916,6 +916,41 @@ class DLIOBenchmark(object):
         return 0.0
 
 
+    def _publish_applied_vector(self, latency_s=None):
+        """Snapshot the knob vector this node's loader is built with into the Window (applied-vector contract).
+
+        Without it the planner cannot credit a window to the configuration that produced it: the ACKs
+        of a DLIO plan carry no step or window, so a moved knob stayed `incumbent_under_sampled`
+        forever and nothing after the first move was ever verified (job-level smoke, 2026-10-06).
+        `physical_applied_step` is the first step AFTER the apply (StorMer convention); the very first
+        vector took effect at step 0.  Node-local by design: each node's planner credits its own vector,
+        so nothing here is a collective.
+        """
+        window = self._window
+        if window is None or not hasattr(window, "set_physical_config"):
+            return
+        vec = {"prefetch_size": int(self.args.prefetch_size), "read_threads": int(self.args.read_threads),
+               "computation_threads": int(self.args.computation_threads)}
+        prev = getattr(self, "_phys_vec", None)
+        if vec == prev:
+            return
+        self._phys_vec = vec
+        self._phys_applied_step = 0 if prev is None else int(getattr(window, "_completed_steps", 0)) + 1
+        window.set_physical_config(vec, self._phys_applied_step,
+                                   apply_cost_s=None if prev is None else latency_s)
+        if prev is not None and hasattr(window, "begin_apply_probe"):
+            window.begin_apply_probe(float(latency_s or 0.0))
+
+    def _refine_apply_cost(self):
+        """One window after an apply: the stall its next step actually saw, into the applied-vector snapshot."""
+        window = self._window
+        if window is None or getattr(window, "_apply_probe", None) is None:
+            return
+        cost = window.apply_probe_result()
+        if cost is None or getattr(self, "_phys_vec", None) is None:
+            return
+        window.set_physical_config(self._phys_vec, self._phys_applied_step, apply_cost_s=float(cost))
+
     def _job_input_sync(self, loader, epoch, step):
         """Job-level critical-path input exposure for the window about to close (opt-in).
 
@@ -1074,6 +1109,8 @@ class DLIOBenchmark(object):
                 # the optimizer has published new knobs. If so, rebuild the
                 # loader with updated parallelism (e.g., read_threads).
                 if at_boundary:
+                    self._refine_apply_cost()
+                    _apply_t0 = perf_counter()
                     new_loader = self.make_loader(
                         epoch=epoch,
                         prefetch_size=self.args.prefetch_size,
@@ -1096,6 +1133,7 @@ class DLIOBenchmark(object):
                         loader.finalize()
                         loader = new_loader
                         batch_iter = loader.next()
+                    self._publish_applied_vector(perf_counter() - _apply_t0)
                     # make_loader is where the gate and optimizer_context calls live
                     # (_ensure_optimizer_runtime_started), so this covers both.
                     direct.mark("boundary_rebuild")
@@ -1214,6 +1252,7 @@ class DLIOBenchmark(object):
                     # present in kwargs or @tunable cannot inject it; see the window-boundary call
                     data_source=getattr(self, "_data_source", "pfs"),
                 )
+                self._publish_applied_vector()
                 self.stats.start_train(epoch)
                 steps = self._train(epoch, loader)
                 self.stats.end_train(epoch, steps)

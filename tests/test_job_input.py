@@ -114,3 +114,43 @@ def test_consumer_boundary_records_steps_only_when_enabled(monkeypatch):
     on = consumer_iterator.ConsumerBoundary(Src())
     on.next_batch(); on.next_batch()
     assert len(on.drain_step_stalls()) == 2 and on.drain_step_stalls() == []
+
+
+def test_applied_vector_snapshot_and_apply_cost():
+    """The loop publishes the applied knob vector (first vector at step 0, a later one one step past the boundary)."""
+    import types
+    from dlio_benchmark import main as main_module
+
+    calls = []
+
+    class W:
+        _completed_steps = 0
+        _apply_probe = None
+
+        def set_physical_config(self, vec, step, apply_cost_s=None):
+            calls.append((dict(vec), step, apply_cost_s))
+
+        def begin_apply_probe(self, latency):
+            self._apply_probe = latency
+
+        def apply_probe_result(self):
+            p, self._apply_probe = self._apply_probe, None
+            return None if p is None else p + 0.5
+
+    bench = types.SimpleNamespace(
+        _window=W(), args=types.SimpleNamespace(prefetch_size=2, read_threads=4, computation_threads=1))
+    pub = main_module.DLIOBenchmark._publish_applied_vector
+    refine = main_module.DLIOBenchmark._refine_apply_cost
+    pub(bench)
+    assert calls == [({"prefetch_size": 2, "read_threads": 4, "computation_threads": 1}, 0, None)]
+    pub(bench)                       # unchanged vector: nothing published
+    assert len(calls) == 1
+    bench._window._completed_steps = 3000
+    bench.args.read_threads = 8
+    pub(bench, 0.2)
+    assert calls[-1] == ({"prefetch_size": 2, "read_threads": 8, "computation_threads": 1}, 3001, 0.2)
+    refine(bench)                    # the probe measured the step after the apply
+    assert calls[-1][2] == 0.7 and calls[-1][1] == 3001
+    n = len(calls)
+    refine(bench)
+    assert len(calls) == n           # probe consumed
