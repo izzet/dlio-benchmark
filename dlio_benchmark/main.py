@@ -1078,6 +1078,9 @@ class DLIOBenchmark(object):
                         epoch=epoch,
                         prefetch_size=self.args.prefetch_size,
                         read_threads=self.args.read_threads,
+                        # Present in kwargs, or @tunable acks a computation_threads plan
+                        # `knob_not_in_kwargs` and the decode knob can never be applied.
+                        computation_threads=self.args.computation_threads,
                         # @tunable only injects a knob whose parameter is PRESENT in kwargs
                         # (tunable.py:110); anything else is acked "rejected". data_source was
                         # declared on make_loader but never passed here, so every data_source plan
@@ -1207,6 +1210,7 @@ class DLIOBenchmark(object):
                     epoch=epoch,
                     prefetch_size=self.args.prefetch_size,
                     read_threads=self.args.read_threads,
+                    computation_threads=self.args.computation_threads,
                     # present in kwargs or @tunable cannot inject it; see the window-boundary call
                     data_source=getattr(self, "_data_source", "pfs"),
                 )
