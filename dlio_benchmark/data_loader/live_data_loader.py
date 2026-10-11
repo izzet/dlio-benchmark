@@ -14,6 +14,7 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
+from dlio_benchmark.data_loader import motivation_timers as _mot
 import math
 import torch
 from torch.utils.data import DataLoader
@@ -121,6 +122,8 @@ class LiveDataLoader(BaseDataLoader):
         if torch.__version__ == '1.3.1':
             kwargs.pop('prefetch_factor', None)
 
+        dataset, collate = _mot.loader_inputs(dataset)
+        _mot.identify(self._args.my_rank, self._args.comm_size)
         self._inner = DataLoader(
             dataset,
             batch_size=self.batch_size,
@@ -129,6 +132,7 @@ class LiveDataLoader(BaseDataLoader):
             pin_memory=self._args.pin_memory,
             drop_last=True,
             worker_init_fn=dataset.worker_init,
+            collate_fn=collate,
             **kwargs,
         )
 
@@ -263,7 +267,9 @@ class LiveDataLoader(BaseDataLoader):
             if self._pending_reconfigure is not None:
                 self._apply_reconfigure()
 
-            for batch in dft_ai.dataloader.fetch.iter(self._inner):
+            inner_iter = iter(self._inner)
+            _mot.wrap_get_data(inner_iter)
+            for batch in dft_ai.dataloader.fetch.iter(_mot.observe(inner_iter, self.epoch_number, step - 1)):
                 maybe_inject_fetch_delay(
                     self.logger,
                     location=f"{self.__class__.__qualname__}.next",

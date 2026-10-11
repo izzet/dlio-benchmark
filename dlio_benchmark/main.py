@@ -14,6 +14,8 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
+from dlio_benchmark.data_loader import motivation_timers as _mot
+
 import os
 import math
 import sys
@@ -1052,7 +1054,8 @@ class DLIOBenchmark(object):
                 # framework.compute() is the sleep AND, on the TensorFlow path, whatever the
                 # framework does with the batch. If next() returned a lazy batch, the read
                 # materialises in here, and fw_compute comes out far above sleep_ms.
-                self.framework.compute(batch, epoch, block_step, self.computation_time)
+                with _mot.span("compute.simulated_step"):
+                    self.framework.compute(batch, epoch, block_step, self.computation_time)
                 direct.mark("fw_compute")
                 self.stats.batch_processed(epoch, overall_step, block)
                 direct.mark("stats_batch_processed")
@@ -1070,7 +1073,7 @@ class DLIOBenchmark(object):
                 #
                 # Rank-symmetric by construction: every rank runs this line, so no rank enters or
                 # leaves the region that does not also enter or leave the barrier.
-                with dft_ai.comm.all_reduce:
+                with dft_ai.comm.all_reduce, _mot.span("barrier_skew.simulated_allreduce"):
                     self.comm.barrier()
                 direct.mark("comm_barrier")
                 if self.do_checkpoint and (
@@ -1362,6 +1365,7 @@ class DLIOBenchmark(object):
                 self._optimizer_ctx = None
                 self._optimizer_started = False
         self.comm.barrier()
+        _mot.flush()
         if dftracer_finalize and dftracer:
             self.args.finalize_dftracer(dftracer)
 
