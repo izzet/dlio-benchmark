@@ -31,6 +31,9 @@ class IndexedTorchDataset(TorchDataset):
                       unix_s=time.time(), mpi_module_before_init=mpi_before,
                       mpi_module_after_init='mpi4py.MPI' in sys.modules,
                       h5py_before_init=hdf_before, h5py_after_init='h5py' in sys.modules)
+        if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2':
+            record['cpus'] = sorted(os.sched_getaffinity(0))
+            record['agent_cpulist'] = os.environ['LIVEFLOW_AGENT_CPUSET']
         (directory/f'worker-{os.getpid()}.json').write_text(json.dumps(record)+'\n')
 
     def __getitem__(self, index):

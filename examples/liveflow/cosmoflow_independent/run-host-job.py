@@ -45,7 +45,7 @@ def main():
     options = ['-o', 'exit-on-error', '-o', 'exit-timeout=5s']
     cmd = ['flux', 'submit', '--flags=waitable', f'--requires=host:{args.host}',
            '-N1', '-n8' if args.kind == 'app' else '-n1',
-           '-c5' if args.kind == 'app' else '-c1',
+           '-c5' if args.kind == 'app' else ('-c2' if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2' else '-c1'),
            '-o', 'cpu-affinity=off', '-o', 'mpibind=off', *options, *command]
     if args.kind == 'app':
         cmd[2:2] = [f'--cwd={directory.resolve()}']
