@@ -1,7 +1,7 @@
 #!/bin/bash
 # Adapted from the project's SHM dlio_tf/run_arm.sh; CPU PyTorch HDF5 on Corona.
 set -euo pipefail
-FREEZE=/p/vast1/izzet/lfmr/liveflow-campaign-v4.0.6-agentperf-20261010
+FREEZE=${DLIO_RUNTIME_ROOT:-/p/vast1/izzet/lfmr/liveflow-campaign-v4.0.6-agentperf-20261010}
 TREE=$FREEZE/source
 OWN=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 source "$TREE/liveflow_shm/tests/cluster_env.sh"
