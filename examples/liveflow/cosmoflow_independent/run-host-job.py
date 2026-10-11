@@ -47,6 +47,9 @@ def main():
            '-N1', '-n8' if args.kind == 'app' else '-n1',
            '-c5' if args.kind == 'app' else ('-c2' if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2' else '-c1'),
            '-o', 'cpu-affinity=off', '-o', 'mpibind=off', *options, *command]
+    if args.kind == 'app' and os.environ.get('DLIO_CRASH_FORENSICS') == '1':
+        (directory / 'rank-stderr').mkdir(exist_ok=True)
+        cmd[2:2] = ['--error='+str(directory.resolve() / 'rank-stderr/rank-{{rank}}.stderr')]
     if args.kind == 'app':
         cmd[2:2] = [f'--cwd={directory.resolve()}']
         if os.environ.get('DLIO_CORE_LIMIT_BYTES'):
@@ -73,7 +76,10 @@ def main():
                 offset = handle.tell()
             lines = (pending+chunk).splitlines(keepends=True)
             pending = lines.pop() if lines and not lines[-1].endswith('\n') else ''
-            line = fatal_line(''.join(lines)+pending)
+            native_text = ''.join(lines)+pending
+            if os.environ.get('DLIO_CRASH_FORENSICS') == '1':
+                native_text += '\n'.join(p.read_text(errors='replace') for p in sorted((directory / 'rank-stderr').glob('*.stderr')))
+            line = fatal_line(native_text)
             if line:
                 detected = True
                 record_failure(directory, args.host, args.kind, jobid, line)
@@ -83,7 +89,10 @@ def main():
     rc = attach.wait()
     if detected and rc == 0: rc = 1
     if rc and not (directory / f'{args.kind}-failure.json').exists():
-        reason = pair_exclusion_reason(logfile.read_text(errors='replace')) if logfile.exists() else None
+        terminal_text = logfile.read_text(errors='replace') if logfile.exists() else ''
+        if os.environ.get('DLIO_CRASH_FORENSICS') == '1':
+            terminal_text += '\n'.join(p.read_text(errors='replace') for p in sorted((directory / 'rank-stderr').glob('*.stderr')))
+        reason = pair_exclusion_reason(terminal_text)
         record_failure(directory, args.host, args.kind, jobid, reason or 'nested job exited unsuccessfully', rc)
     return rc
 

@@ -55,7 +55,7 @@ case "$ARM" in
 esac
 printf 'arm=%s\nprefix=%s\nruntime=%s\ndlio_commit=%s\nanalysis=static raw-only offline analysis; LiveFlow native online node-local agent\ncache=advisory cold own rank shard before each epoch; first20 steps per epoch excluded; campaign\n' "$ARM" "$prefix" "$FREEZE" "$DLIO_COMMIT" > "$RUN_DIR/config.txt"
 # Record relevant task settings, not login environment/secrets.
-env | sort | rg '^(LIVEFLOW_|DFTRACER_|DFOPTIMIZER_|DLIO_|IBV_FORK_SAFE=|RDMAV_FORK_SAFE=|MV2_SUPPORT_FORK_SAFETY=|OMP_|MKL_|OPENBLAS_|PYTHONPATH=|LD_LIBRARY_PATH=)' > "$RUN_DIR/runtime-env.txt"
+env | sort | rg '^(LIVEFLOW_|DFTRACER_|DFOPTIMIZER_|DLIO_|IBV_FORK_SAFE=|RDMAV_FORK_SAFE=|MV2_SUPPORT_FORK_SAFETY=|OMP_|MKL_|OPENBLAS_|PYTHONPATH=|LD_LIBRARY_PATH=|PYTHONFAULTHANDLER=)' > "$RUN_DIR/runtime-env.txt"
 appy="$VENV_DLIO/bin/python";agentpy="$LIVEFLOW_AGENT_VENV_DIR/bin/python"
 # LF pays for two dedicated physical agent cores. Comparators retain shipped masks.
 if [[ "$ARM" == liveflow ]];then
@@ -85,6 +85,13 @@ if [[ -n "$stages" ]];then
   sleep 1
  done
  [[ $ready == 1 ]] || { echo 'Agent readiness failed';exit 1; }
+fi
+sampler_pid=''
+if [[ ${DLIO_CRASH_FORENSICS:-0} == 1 ]];then
+ [[ "$ARM" == liveflow && ${PYTHONFAULTHANDLER:-0} == 1 ]]
+ hostrun "$agentpy" -u "$OWN/host-memory-sampler.py" "$RUN_DIR" > "$RUN_DIR/host-memory.jsonl" 2> "$RUN_DIR/host-memory-sampler.err" &
+ sampler_pid=$!
+ trap 'touch "$RUN_DIR/host-memory.stop"; wait "$sampler_pid" || true' EXIT
 fi
 arm_w=4;arm_p=2
 case "$ARM" in maxresource) arm_w=12;arm_p=1608;;maxresource-adapted) arm_w=12;arm_p=696;;static6) arm_w=6;;static8) arm_w=8;;static-best) arm_w=${DLIO_STATIC_W:?};arm_p=${DLIO_STATIC_P:?};;esac
