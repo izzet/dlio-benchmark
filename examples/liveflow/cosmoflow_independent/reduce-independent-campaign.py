@@ -68,13 +68,16 @@ for arm in sorted(root.glob('*/*')):
  elapsed=dict(x.split('=',1) for x in (arm/'app-elapsed.txt').read_text().splitlines());wall=float(elapsed['end_s'])-float(elapsed['start_s'])
  results[f'{arm.parent.name}/{arm.name}']=dict(status=status,analyzer_complete=native_complete,analyzer_hosts=len(agents),partial_analyzer_diagnostic=partial_waits if not native_complete else None,sample_identity=f'8 ranks x {epochs} exact seeded {nsteps}-sample sequences; no loss in DLIO',app_elapsed_s=wall,steady_decode_wait_ms=1000*steady_decode if steady_decode is not None else None,steady_storage_wait_ms=1000*steady_storage if steady_storage is not None else None,analyzer_steady_only_windows=len(steady_waits),steady_steps_per_rank=len(critical),steady_critical_step_ms=1000*statistics.mean(critical.values()),comm_wait_ms=1000*comm if comm is not None else None,compute_time_ms=1000*compute if compute is not None else None,largest_step_component=largest_component,decode_wait_ms=1000*decode if decode is not None else None,storage_wait_ms=1000*storage if storage is not None else None,larger_input_wait=('decode' if decode>storage else 'storage') if denom else 'unmeasured',analyzer_valid_windows=valid,analyzer_absent_or_invalid_windows=invalid,analyzer_scope='all valid native windows, including startup; per-step max-process exposure, step-count weighted across nodes',read_bytes=read_bytes if read_available else None,aggregate_read_GB_s=read_bytes/1e9/wall if read_available else None,aggregate_training_read_GB_s=read_bytes/1e9/sum(training_epoch_wall.values()) if read_available else None,training_wall_s=sum(training_epoch_wall.values()),training_read_rate_scope='all analyzer POSIX read bytes / sum over epochs of longest rank training interval; includes first20 steps, excludes application initialization and between-epoch cold eviction',read_rate_scope='analyzer reader POSIX read bytes / full application wall time',cpu_per_rank=cpu,cpu_mean_fraction_6_cores=statistics.mean(x['fraction_of_6_cores'] for x in cpu if x['fraction_of_6_cores'] is not None),cpu_caveat='0.2s process-tree samples; worker exit can omit final sub-interval CPU')
 
- # MLPerf Storage v1 uses configured nominal compute as numerator, rather than measured oversleep.
+ # Use this arm's recorded nominal compute, including the H100 screen.
+ config=dict(line.split('=',1) for line in (arm/'config.txt').read_text().splitlines() if '=' in line)
+ nominal_compute_s=float(config.get('compute_s','.00551'))
+ assert nominal_compute_s>0
  actual=[];nominal=[];numerator=denominator=0.
  for p in sorted((arm/'dlio').glob('*_output.json')):
   d=json.loads(p.read_text())
   for epoch in range(1,epochs+1):
    e=d[str(epoch)];a=e['au']['block1'];comp=e['compute']['block1'][1:]
-   n=len(comp)*.00551
+   n=len(comp)*nominal_compute_s
    assert a>0 and len(comp)==nsteps-1,(p,epoch,len(comp),a)
    elapsed=sum(comp)/(a/100)
    actual.append(a);nominal.append(100*n/elapsed);numerator+=n;denominator+=elapsed
@@ -84,7 +87,7 @@ for arm in sorted(root.glob('*/*')):
 aggregate={}
 for armname in sorted({v['arm'] for v in results.values()}):
  values=[v for v in results.values() if v['arm']==armname]
- a=dict(hosts=len(values),mean_host_elapsed_s=statistics.mean(v['app_elapsed_s'] for v in values),max_host_elapsed_s=max(v['app_elapsed_s'] for v in values),mean_host_step_ms=statistics.mean(v['steady_critical_step_ms'] for v in values),mean_host_au_percent=statistics.mean(v['nominal_au_percent'] for v in values),pooled_au_percent=100*sum(v['au_nominal_compute_s'] for v in values)/sum(v['au_measured_denominator_s'] for v in values),sum_host_read_GB_s=sum(v['aggregate_read_GB_s'] or 0 for v in values),mean_cpu_fraction_6_cores=statistics.mean(v['cpu_mean_fraction_6_cores'] for v in values),hosts_passing70=sum(v['passes_config70'] for v in values),hosts_passing90=sum(v['passes_guidelines90'] for v in values))
+ a=dict(hosts=len(values),mean_host_elapsed_s=statistics.mean(v['app_elapsed_s'] for v in values),max_host_elapsed_s=max(v['app_elapsed_s'] for v in values),mean_host_step_ms=statistics.mean(v['steady_critical_step_ms'] for v in values),mean_host_au_percent=statistics.mean(v['nominal_au_percent'] for v in values),pooled_au_percent=100*sum(v['au_nominal_compute_s'] for v in values)/sum(v['au_measured_denominator_s'] for v in values),sum_host_read_GB_s=(sum(v['aggregate_read_GB_s'] for v in values) if all(v['aggregate_read_GB_s'] is not None for v in values) else None),read_rate_measured_hosts=sum(v['aggregate_read_GB_s'] is not None for v in values),mean_cpu_fraction_6_cores=statistics.mean(v['cpu_mean_fraction_6_cores'] for v in values),hosts_passing70=sum(v['passes_config70'] for v in values),hosts_passing90=sum(v['passes_guidelines90'] for v in values))
  for key in ['decode_wait_ms','storage_wait_ms','steady_decode_wait_ms','steady_storage_wait_ms','comm_wait_ms']:
   present=[v[key] for v in values if v[key] is not None]
   a['mean_host_'+key]=statistics.mean(present) if present else None
@@ -97,7 +100,7 @@ if paired is not None:
  order_file=root/'order.txt'
  expected_arms=order_file.read_text().splitlines() if order_file.exists() else ['original','maxresource-adapted','static-best','liveflow']
  assert expected_arms and len(set(expected_arms))==len(expected_arms)
- assert set(expected_arms)<= {'original','maxresource-adapted','static-best','liveflow'}
+ assert set(expected_arms)<= {'original','maxresource-adapted','static-best','liveflow','static-w12','static-w24'}
  for armname in expected_arms:
   assert {v['host'] for v in results.values() if v['arm']==armname}==paired,('incomplete paired arm',armname)
 output=dict(paired_hosts=sorted(paired) if paired is not None else None,excluded_hosts=exclusions,per_host=results,aggregate=aggregate,replications=1,scope='one paired campaign block; hosts are not campaign repetitions',epochs=epochs,steps_per_epoch=nsteps)
