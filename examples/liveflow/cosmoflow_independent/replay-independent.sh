@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
-RUNTIME=/p/vast1/izzet/lfmr/liveflow-campaign-v4.0.6-agentperf-20261010
+RUNTIME=${DLIO_RUNTIME_ROOT:-/p/vast1/izzet/lfmr/liveflow-campaign-v4.0.6-agentperf-20261010}
 TREE=$RUNTIME/source
 source "$TREE/liveflow_shm/tests/cluster_env.sh"
 source "$TREE/optimization/setup_env_corona.sh"

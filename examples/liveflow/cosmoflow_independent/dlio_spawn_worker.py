@@ -31,10 +31,15 @@ class IndexedTorchDataset(TorchDataset):
                       unix_s=time.time(), mpi_module_before_init=mpi_before,
                       mpi_module_after_init='mpi4py.MPI' in sys.modules,
                       h5py_before_init=hdf_before, h5py_after_init='h5py' in sys.modules)
-        if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2':
+        if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2' or os.environ.get('DLIO_LEAN_WORKER_RECORDS') == '1':
             record['cpus'] = sorted(os.sched_getaffinity(0))
-            record['agent_cpulist'] = os.environ['LIVEFLOW_AGENT_CPUSET']
-        (directory/f'worker-{os.getpid()}.json').write_text(json.dumps(record)+'\n')
+            record['agent_cpulist'] = os.environ.get('LIVEFLOW_AGENT_CPUSET')
+        if os.environ.get('DLIO_LEAN_WORKER_RECORDS') == '1':
+            # One pipe write, below PIPE_BUF: retain exact per-worker startup/mask
+            # in the existing host log instead of creating thousands of files.
+            os.write(2, ('DLIO_WORKER_LIFECYCLE '+json.dumps(record)+'\n').encode())
+        else:
+            (directory/f'worker-{os.getpid()}.json').write_text(json.dumps(record)+'\n')
 
     def __getitem__(self, index):
         return super().__getitem__(index), index
