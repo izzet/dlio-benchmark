@@ -43,7 +43,8 @@ with (root/'cpu-per-rank.csv').open('w') as f:
 for arm,a in d['aggregate'].items():
  assert a['hosts']==nhosts,(arm,a['hosts'])
  vals=[v for v in d['per_host'].values() if v['arm']==arm]
- a['median_host_noncalibration_window_seconds']=statistics.median(v['median_noncalibration_window_seconds'] for v in vals if v['median_noncalibration_window_seconds'] is not None)
+ window_seconds=[v['median_noncalibration_window_seconds'] for v in vals if v['median_noncalibration_window_seconds'] is not None]
+ a['median_host_noncalibration_window_seconds']=statistics.median(window_seconds) if window_seconds else None
  if arm=='liveflow':
   a['hosts_with_first_apply']=sum(v['first_apply_step'] is not None for v in vals)
   a['first_apply_steps']={v['host']:v['first_apply_step'] for v in vals}
@@ -54,7 +55,11 @@ for arm,a in d['aggregate'].items():
 excluded=d.get('excluded_hosts',[])
 lines=[f'# Independent-host A100 campaign {root.name}', '', f'Eligible paired hosts: {nhosts}; excluded across all arms: {[x["host"] for x in excluded]}. All excluded raw data retained. One diagnostic block: hosts are not campaign repetitions. Raw per-host results: per-host.csv; CPU: cpu-per-rank.csv; actual native noncalibration windows (tails retained) and LF trajectory in block-results.json and lf-trajectory.json.','', '| Arm | Host-mean elapsed(s) | Steady step(ms) | AU(%) | Decode/storage wait(ms) | Read(GB/s) | CPU(% of6cores/rank) | Median host window(s) |','|---|---:|---:|---:|---|---:|---:|---:|']
 for arm,a in d['aggregate'].items():
- lines.append(f"|{arm}|{a['mean_host_elapsed_s']:.3f}|{a['mean_host_step_ms']:.3f}|{a['mean_host_au_percent']:.3f}|{a['mean_host_steady_decode_wait_ms']:.3f}/{a['mean_host_steady_storage_wait_ms']:.3f}|{a['sum_host_read_GB_s']:.3f}|{100*a['mean_cpu_fraction_6_cores']:.2f}|{a['median_host_noncalibration_window_seconds']:.3f}|")
+ fmt=lambda value:'NA' if value is None else f'{value:.3f}'
+ lines.append(f"|{arm}|{fmt(a['mean_host_elapsed_s'])}|{fmt(a['mean_host_step_ms'])}|{fmt(a['mean_host_au_percent'])}|{fmt(a['mean_host_steady_decode_wait_ms'])}/{fmt(a['mean_host_steady_storage_wait_ms'])}|{fmt(a['sum_host_read_GB_s'])}|{100*a['mean_cpu_fraction_6_cores']:.2f}|{fmt(a['median_host_noncalibration_window_seconds'])}|")
+lines+=['','Missing valid wait/window measurements are NA, never zero. Completed analysis does not imply valid wait coverage.']
+for arm,a in d['aggregate'].items():
+ lines.append(f"{arm}: mean valid step bins/host={a.get('analyzer_valid_step_bins_mean_host', 'NA')}; steady-window bins/host={a.get('analyzer_steady_window_step_bins_mean_host', 'NA')}.")
 a=d['aggregate']['liveflow'];lines+=['',f"LiveFlow first-apply steps: {a['first_apply_steps']}",f"LiveFlow confirmation steps at publication (of{totalsteps}): {a['convergence_steps']}",f"Final workers: {a['final_workers']}",'',f'All{nhosts*narms} host-arm statuses0,{nhosts*narms*8} exact rank identities, all final SHM drops/backlog/unclaimed0. Wait coverage includes valid native windows only; detailed bin coverage retained. Decode/storage are exposed per-step waits, not service times; common MPI barrier is node-local. Read uses full application wall. AU uses nominal5.51ms numerator; thresholds70/90 reported. Compute is simulated CPU sleep; no model/loss. Cold eviction advisory, shared cache; retained HDF5/PyTorch format and dataset sizing are explicit MLPerf deviations. MaxResource uses user-adapted binding-SHM formula.']
 (root/'RESULTS.md').write_text('\n'.join(lines)+'\n')
 print('\n'.join(lines[:11]))
