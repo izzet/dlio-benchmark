@@ -15,6 +15,8 @@
    limitations under the License.
 """
 import h5py
+import os
+from contextlib import nullcontext
 
 from dlio_benchmark.common.constants import MODULE_DATA_READER
 from dlio_benchmark.utils.utility import Profile, dft_ai
@@ -44,9 +46,14 @@ class HDF5Reader(FormatReader):
     def get_sample(self, filename, sample_index):
         super().get_sample(filename, sample_index)
         image_size = 0
-        for idx in self.dataset_indices:
-            image = self.open_file_map[filename][f'records_{idx}'][sample_index]
-            image_size += image.nbytes
+        # Opt-in DLIO-PyTorch adapter: annotation only; sample bytes and outputs are unchanged.
+        annotate = (os.environ.get("LIVEFLOW_DLIO_HDF5_DECODE", "0") == "1"
+                    and self._args.framework.value == "pytorch")
+        span = dft_ai.data.derive("hdf5_sample") if annotate else nullcontext()
+        with span:
+            for idx in self.dataset_indices:
+                image = self.open_file_map[filename][f'records_{idx}'][sample_index]
+                image_size += image.nbytes
         dlp.update(image_size=image_size)
         dft_ai.update(image_size=image.nbytes)
 

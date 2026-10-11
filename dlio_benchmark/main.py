@@ -1561,6 +1561,15 @@ if _HAS_DFOPTIMIZER:
             default=max(0, _knob_min_threads), range=(_knob_min_threads, _knob_max_threads), type=int,
             cost_seconds=_REBUILD_COST,
             responds_to={
+                # PyTorch HDF5 workers perform read and decompress in the same pool.
+                **({"decode_pressure": {
+                    "direction": "increase",
+                    "step_mode": "evidence",
+                    "min_persistence": 1,
+                    "cooldown_windows": 1,
+                    "apply_when": _knob_boundary,
+                }} if (os.environ.get("LIVEFLOW_DLIO_HDF5_DECODE", "0") == "1"
+                       and os.environ.get("LIVEFLOW_WORKLOAD") == "dlio-pytorch") else {}),
                 "reader_parallelism": {
                     "direction": "increase",
                     "step_mode": "evidence",
