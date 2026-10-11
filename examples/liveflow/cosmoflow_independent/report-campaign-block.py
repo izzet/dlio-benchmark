@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import csv,datetime,json,pathlib,statistics,sys
-root=pathlib.Path(sys.argv[1]);nhosts=2 if len(sys.argv)>2 and sys.argv[2]=='smoke' else 16;narms=1 if nhosts==2 else 4;totalsteps=4096 if nhosts==2 else 20480;d=json.load((root/'block-results.json').open());trajectory=json.load((root/'lf-trajectory.json').open());rows=[]
+root=pathlib.Path(sys.argv[1]);nhosts=2 if len(sys.argv)>2 and sys.argv[2]=='smoke' else 16;narms=1 if nhosts==2 else 4;totalsteps=4096 if nhosts==2 else 20480;d=json.load((root/'block-results.json').open());nhosts=len(d['paired_hosts']) if d.get('paired_hosts') is not None else nhosts;trajectory=json.load((root/'lf-trajectory.json').open());rows=[]
 assert len(d['per_host'])==nhosts*narms,('incomplete successful host-arm results',len(d['per_host']))
 for key,v in d['per_host'].items():
  arm,host=key.split('/');p=root/arm/host
@@ -51,7 +51,8 @@ for arm,a in d['aggregate'].items():
   a['hosts_with_confirmed_final_configuration_before_end']=sum(v['convergence_step'] is not None for v in vals)
   a['final_workers']={v['host']:v['final_workers'] for v in vals}
 (root/'block-results.json').write_text(json.dumps(d,indent=2)+'\n')
-lines=[f'# Independent-host A100 campaign {root.name}', '', 'One diagnostic block: hosts are not campaign repetitions. Raw per-host results: per-host.csv; CPU: cpu-per-rank.csv; actual native noncalibration windows (tails retained) and LF trajectory in block-results.json and lf-trajectory.json.','', '| Arm | Host-mean elapsed(s) | Steady step(ms) | AU(%) | Decode/storage wait(ms) | Read(GB/s) | CPU(% of6cores/rank) | Median host window(s) |','|---|---:|---:|---:|---|---:|---:|---:|']
+excluded=d.get('excluded_hosts',[])
+lines=[f'# Independent-host A100 campaign {root.name}', '', f'Eligible paired hosts: {nhosts}; excluded across all arms: {[x["host"] for x in excluded]}. All excluded raw data retained. One diagnostic block: hosts are not campaign repetitions. Raw per-host results: per-host.csv; CPU: cpu-per-rank.csv; actual native noncalibration windows (tails retained) and LF trajectory in block-results.json and lf-trajectory.json.','', '| Arm | Host-mean elapsed(s) | Steady step(ms) | AU(%) | Decode/storage wait(ms) | Read(GB/s) | CPU(% of6cores/rank) | Median host window(s) |','|---|---:|---:|---:|---|---:|---:|---:|']
 for arm,a in d['aggregate'].items():
  lines.append(f"|{arm}|{a['mean_host_elapsed_s']:.3f}|{a['mean_host_step_ms']:.3f}|{a['mean_host_au_percent']:.3f}|{a['mean_host_steady_decode_wait_ms']:.3f}/{a['mean_host_steady_storage_wait_ms']:.3f}|{a['sum_host_read_GB_s']:.3f}|{100*a['mean_cpu_fraction_6_cores']:.2f}|{a['median_host_noncalibration_window_seconds']:.3f}|")
 a=d['aggregate']['liveflow'];lines+=['',f"LiveFlow first-apply steps: {a['first_apply_steps']}",f"LiveFlow confirmation steps at publication (of{totalsteps}): {a['convergence_steps']}",f"Final workers: {a['final_workers']}",'',f'All{nhosts*narms} host-arm statuses0,{nhosts*narms*8} exact rank identities, all final SHM drops/backlog/unclaimed0. Wait coverage includes valid native windows only; detailed bin coverage retained. Decode/storage are exposed per-step waits, not service times; common MPI barrier is node-local. Read uses full application wall. AU uses nominal5.51ms numerator; thresholds70/90 reported. Compute is simulated CPU sleep; no model/loss. Cold eviction advisory, shared cache; retained HDF5/PyTorch format and dataset sizing are explicit MLPerf deviations. MaxResource uses user-adapted binding-SHM formula.']

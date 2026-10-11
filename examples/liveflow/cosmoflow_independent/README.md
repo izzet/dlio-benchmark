@@ -50,8 +50,11 @@ source hashes, exact command, config and relevant environment before launching.
 
 Host-scoped Flux jobs use exit-on-error and a5s exit timeout. An application
 fatal-log monitor cancels only that host's nested job, records its failure and
-retains partial traces. Other hosts finish the current arm. The block then stops;
-paired-host exclusion is a possible disclosed fallback, not implemented policy.
+retains partial traces. Other hosts finish the current arm. Native crashed hosts are excluded from every arm in their block, with raw data
+retained and failure/exclusion records disclosed. At least14of16 hosts must remain
+paired; otherwise the block stops as invalid. Non-native/unrecorded failures stop
+the block. DLIO_EXCLUDE_CRASHED_HOSTS=0 requests strict stop-on-any-failure.
+These exclusions can bias host selection and must be reported per block.
 No script here automatically submits the next block or authorizes a campaign.
 
 Run only after the orchestrator releases the allocation and any storage hold:

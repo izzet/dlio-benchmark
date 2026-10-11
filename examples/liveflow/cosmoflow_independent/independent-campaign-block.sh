@@ -19,6 +19,9 @@ mkdir -p "$ROOT"
 flux exec -r all hostname | sort -u > "$ROOT/hosts.txt"
 mapfile -t hosts < "$ROOT/hosts.txt"
 [[ ${#hosts[@]} == 16 ]]
+cp "$ROOT/hosts.txt" "$ROOT/paired-hosts.txt"
+export DLIO_EXCLUDE_CRASHED_HOSTS=${DLIO_EXCLUDE_CRASHED_HOSTS:-1}
+export DLIO_MIN_PAIRED_HOSTS=${DLIO_MIN_PAIRED_HOSTS:-14}
 case "$block" in
  1) arms=(original maxresource-adapted static-best liveflow);;
  2) arms=(maxresource-adapted static-best liveflow original);;
@@ -27,20 +30,27 @@ case "$block" in
 esac
 printf '%s\n' "${arms[@]}" > "$ROOT/order.txt"
 for arm in "${arms[@]}";do
- pids=()
- for host in "${hosts[@]}";do
+ pids=();mapfile -t paired < "$ROOT/paired-hosts.txt"
+ for host in "${paired[@]}";do
   bash "$OWN/run-arm-independent-campaign.sh" "$ROOT/$arm/$host" "$arm" "$host" > "$ROOT/$arm-$host-launch.log" 2>&1 &
   pids+=("$!")
  done
  rc=0
- for pid in "${pids[@]}";do wait "$pid" || rc=1;done
+ for i in "${!pids[@]}";do
+  if ! wait "${pids[$i]}";then
+   if [[ $DLIO_EXCLUDE_CRASHED_HOSTS == 1 ]];then
+    python3 "$OWN/paired-hosts.py" "$ROOT" "$arm" "${paired[$i]}" --minimum "$DLIO_MIN_PAIRED_HOSTS" >> "$ROOT/pair-exclusion.log" 2>&1 || rc=1
+   else rc=1;fi
+  fi
+ done
  [[ $rc == 0 ]] || exit 1
  printf '%s complete\n' "$arm"
 done
 # Parallel static replays: at most three single-worker analyses per host,
 # only after all timed application arms finish. LF facts were made natively.
 pids=()
-for host in "${hosts[@]}";do
+mapfile -t paired < "$ROOT/paired-hosts.txt"
+for host in "${paired[@]}";do
  for arm in original maxresource-adapted static-best;do
   dir=$ROOT/$arm/$host
   flux run --requires="host:$host" -N1 -n1 -c1 -o cpu-affinity=off -o mpibind=off -o exit-timeout=none bash "$OWN/replay-independent.sh" "$dir" "$host" > "$dir/replay.log" 2>&1 &

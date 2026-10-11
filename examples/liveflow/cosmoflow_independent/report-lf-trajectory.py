@@ -2,7 +2,9 @@
 """Join retained planner evidence to actual rank step timing and worker counts."""
 import collections,datetime,json,pathlib,statistics,sys
 root=pathlib.Path(sys.argv[1]);out={}
+paired_file=root/'paired-hosts.txt';paired=set(paired_file.read_text().splitlines()) if paired_file.exists() else None
 for host in sorted(root.glob('liveflow/*')):
+ if paired is not None and host.name not in paired:continue
  paths=list(host.glob('agent_*/dfdiagnoser_agent/dfdiagnoser.log'))
  if not paths:continue
  ranks={}

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 import csv,json,pathlib,statistics,sys
 root=pathlib.Path(sys.argv[1]);results={};epochs=int(sys.argv[2]) if len(sys.argv)>2 else 5;nsteps=int(sys.argv[3]) if len(sys.argv)>3 else 4096
+paired_file=root/'paired-hosts.txt';paired=set(paired_file.read_text().splitlines()) if paired_file.exists() else None
+if paired is not None:assert 14<=len(paired)<=16,('invalid paired host count',len(paired))
 for arm in sorted(root.glob('*/*')):
+ if paired is not None and arm.name not in paired:continue
  files=sorted((arm/'screen-metrics').glob('rank-*.json'))
  if len(files)!=8 or not (arm/'status.txt').exists():continue
  status=dict(line.split('=',1) for line in (arm/'status.txt').read_text().splitlines())
@@ -89,6 +92,10 @@ for armname in sorted({v['arm'] for v in results.values()}):
  a['analyzer_valid_step_bins_mean_host']=statistics.mean(v['analyzer_valid_step_bins'] for v in values)
  a['analyzer_steady_window_step_bins_mean_host']=statistics.mean(v['analyzer_steady_window_step_bins'] for v in values)
  aggregate[armname]=a
-output=dict(per_host=results,aggregate=aggregate,replications=1,scope='one paired campaign block; hosts are not campaign repetitions',epochs=epochs,steps_per_epoch=nsteps)
+exclusions=json.loads((root/'excluded-hosts.json').read_text()) if (root/'excluded-hosts.json').exists() else []
+if paired is not None:
+ for armname in ['original','maxresource-adapted','static-best','liveflow']:
+  assert {v['host'] for v in results.values() if v['arm']==armname}==paired,('incomplete paired arm',armname)
+output=dict(paired_hosts=sorted(paired) if paired is not None else None,excluded_hosts=exclusions,per_host=results,aggregate=aggregate,replications=1,scope='one paired campaign block; hosts are not campaign repetitions',epochs=epochs,steps_per_epoch=nsteps)
 (root/'block-results.json').write_text(json.dumps(output,indent=2)+'\n')
 print(json.dumps(aggregate,indent=2))
