@@ -10,7 +10,13 @@ if __name__ == '__main__':
     cpus=list(cores.values());rank=int(os.environ['FLUX_TASK_RANK']);local=rank%8
     os.environ['RANK']=str(rank)
     assert len(cpus)>=48,(socket.gethostname(),len(cpus))
-    chosen=cpus[local*6:(local+1)*6];os.sched_setaffinity(0,chosen)
+    chosen=cpus[local*6:(local+1)*6];physical_count=6
+    if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2':
+        from dlio_cpu_affinity import partition
+        plan=partition();chosen=plan['rank_cpus'][local];physical_count=plan['rank_physical_cores'][local]
+        assert os.environ['LIVEFLOW_AGENT_CPUSET']==plan['agent_cpulist']
+    os.sched_setaffinity(0,chosen)
+    assert sorted(os.sched_getaffinity(0))==sorted(chosen)
     out=pathlib.Path(os.environ['RUN_DIR'])/'rank-bindings';out.mkdir(exist_ok=True)
     source=pathlib.Path(os.environ['LIVEFLOW_SNAPSHOT_ROOT'])
     # Start an MPI/DFTracer-free server before importing the application.
@@ -46,7 +52,7 @@ if __name__ == '__main__':
         spec['step_factor'] = 2.0
         print('DLIO registry read_threads values=1..12 step_factor=2 window_target_s='+os.environ['LIVEFLOW_WINDOW_TARGET_S'],flush=True)
     assert pathlib.Path(app.__file__).resolve()==pathlib.Path(os.environ['DLIO_APP_ROOT'])/'dlio_benchmark/main.py',app.__file__
-    (out/f'rank-{rank}.json').write_text(json.dumps(dict(rank=rank,host=socket.gethostname(),cpus=chosen,physical_cores=6,module=app.__file__,sha256=hashlib.sha256(pathlib.Path(app.__file__).read_bytes()).hexdigest()),indent=2))
+    (out/f'rank-{rank}.json').write_text(json.dumps(dict(rank=rank,host=socket.gethostname(),cpus=chosen,physical_cores=physical_count,pid=os.getpid(),isolated_agent_cpus=os.environ.get("LIVEFLOW_AGENT_CPUSET"),module=app.__file__,sha256=hashlib.sha256(pathlib.Path(app.__file__).read_bytes()).hexdigest()),indent=2))
     # Honor the pinned seeded shuffle intent in the retained PyTorch index-reader adaptation.
     # TFRecord/TF shuffle-buffer semantics remain an explicit format/reader deviation.
     import numpy as np
@@ -176,7 +182,7 @@ if __name__ == '__main__':
         app.main()
     finally:
         monitor.terminate();monitor.wait();step_stream.close();lifecycle_stream.close();identity_stream.close()
-        (metrics_out/f'rank-{rank}.json').write_text(json.dumps(dict(rank=rank,physical_cores=6,steps=steps,cold=cold,cpu_sampling_seconds=.2,cpu_caveat='worker exit between samples can omit final <0.2s CPU per worker'),separators=(',',':'))+'\n')
+        (metrics_out/f'rank-{rank}.json').write_text(json.dumps(dict(rank=rank,physical_cores=physical_count,steps=steps,cold=cold,cpu_sampling_seconds=.2,cpu_caveat='worker exit between samples can omit final <0.2s CPU per worker'),separators=(',',':'))+'\n')
 
     expected={}
     for epoch in range(1,int(os.environ.get("DLIO_CAMPAIGN_EPOCHS","5"))+1):

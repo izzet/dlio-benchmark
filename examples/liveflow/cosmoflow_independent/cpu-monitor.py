@@ -8,6 +8,10 @@ def terminate(*_):
  stop=True
 signal.signal(signal.SIGTERM,terminate)
 out.parent.mkdir(exist_ok=True)
+bindings=None;recorded=set()
+if os.environ.get('DLIO_LF_ISOLATE_CORES') == '2':
+ bindings=out.with_name(out.name.replace('cpu-rank-','bindings-rank-')).open('w',buffering=1)
+ expected=sorted(os.sched_getaffinity(parent))
 with out.open('w',buffering=1) as f:
  while not stop and pathlib.Path(f'/proc/{parent}').exists():
   queue=[parent];seen=set();current={}
@@ -17,10 +21,17 @@ with out.open('w',buffering=1) as f:
    seen.add(pid)
    try:
     base=pathlib.Path(f'/proc/{pid}');s=(base/'stat').read_text().rsplit(')',1)[1].split()
-    key=(pid,s[19]);ticks=(int(s[11])+int(s[12]))/hz;current[key]=ticks
+    key=(pid,s[19])
+    if bindings is not None and key not in recorded:
+     mask=sorted(os.sched_getaffinity(pid))
+     bindings.write(json.dumps(dict(pid=pid,start_ticks=s[19],parent_pid=int(s[1]),name=(base/'comm').read_text().strip(),cpus=mask,expected_rank_cpus=expected,matches_rank_mask=mask==expected))+'\n')
+     recorded.add(key)
+    ticks=(int(s[11])+int(s[12]))/hz;current[key]=ticks
     queue.extend(map(int,(base/f'task/{pid}/children').read_text().split()))
    except (FileNotFoundError,ProcessLookupError,PermissionError):pass
   for key,value in current.items():total+=max(0,value-last.get(key,0))
   last.update(current)
   f.write(json.dumps(dict(monotonic=time.monotonic(),cpu_seconds=total,processes=len(current)))+'\n')
   time.sleep(.2)
+
+if bindings is not None:bindings.close()

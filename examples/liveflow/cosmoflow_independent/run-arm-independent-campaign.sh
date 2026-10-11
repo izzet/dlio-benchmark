@@ -57,6 +57,17 @@ printf 'arm=%s\nprefix=%s\nruntime=%s\ndlio_commit=%s\nanalysis=static raw-only 
 # Record relevant task settings, not login environment/secrets.
 env | sort | rg '^(LIVEFLOW_|DFTRACER_|DFOPTIMIZER_|DLIO_|IBV_FORK_SAFE=|RDMAV_FORK_SAFE=|MV2_SUPPORT_FORK_SAFETY=|OMP_|MKL_|OPENBLAS_|PYTHONPATH=|LD_LIBRARY_PATH=)' > "$RUN_DIR/runtime-env.txt"
 appy="$VENV_DLIO/bin/python";agentpy="$LIVEFLOW_AGENT_VENV_DIR/bin/python"
+# LF pays for two dedicated physical agent cores. Comparators retain shipped masks.
+if [[ "$ARM" == liveflow ]];then
+ export DLIO_LF_ISOLATE_CORES=2
+ LIVEFLOW_AGENT_CPUSET=$(hostrun "$agentpy" "$OWN/dlio_cpu_affinity.py" --output "$RUN_DIR/core-isolation.json")
+ export LIVEFLOW_AGENT_CPUSET
+ [[ -n "$LIVEFLOW_AGENT_CPUSET" ]]
+else
+ unset DLIO_LF_ISOLATE_CORES LIVEFLOW_AGENT_CPUSET
+fi
+# Record derived affinity variables after host-specific topology discovery.
+env | sort | rg '^(DLIO_LF_ISOLATE_CORES=|LIVEFLOW_AGENT_CPUSET=)' >> "$RUN_DIR/runtime-env.txt" || true
 agent_pid=''
 if [[ -n "$stages" ]];then
  hostrun "$agentpy" -c 'import os;from shm_reader import ShmRingReader;p=os.environ["LIVEFLOW_SHM_PREFIX"];ShmRingReader(p+".trace",lane_count=2048,lane_bytes=8388608,create=True).close();ShmRingReader(p+".control",lane_count=2048,lane_bytes=65536,create=True).close()' > "$RUN_DIR/shm-create.log" 2>&1
