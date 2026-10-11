@@ -38,15 +38,18 @@ def partition():
     reserved = {max((key for key in physical if key[0] == s), key=lambda k: min(groups[k]))
                 for s in sockets}
     agent = sorted(c for key in reserved for c in groups[key])
-    ranks = [sorted(c for key in physical[r*6:(r+1)*6] if key not in reserved for c in groups[key])
+    # Preserve the shipped wrapper's ONE logical CPU per physical core.
+    ranks = [sorted(min(groups[key]) for key in physical[r*6:(r+1)*6] if key not in reserved)
              for r in range(8)]
     app = sorted(c for rank in ranks for c in rank)
     assert not set(agent) & set(app)
-    assert sorted(agent+app) == info['allowed']
+    assert len(app) == 46
+    assert len({key for key in physical if key not in reserved}) == 46
     assert all(ranks) and len(set(app)) == len(app)
     return dict(topology=info, agent_cpus=agent, agent_cpulist=cpulist(agent),
                 agent_physical_cores=2, app_cpus=app, app_physical_cores=46,
-                rank_cpus=ranks,
+                rank_cpus=ranks, unused_allowed_cpus=sorted(set(info['allowed'])-set(agent)-set(app)),
+                app_smt_policy='shipped one logical CPU per physical core; agent online siblings allowed',
                 rank_physical_cores=[sum(key not in reserved for key in physical[r*6:(r+1)*6]) for r in range(8)])
 
 
