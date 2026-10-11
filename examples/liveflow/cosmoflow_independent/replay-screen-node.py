@@ -55,7 +55,9 @@ for c in controls:
  control_records.append(Event(m,base64.b64decode(c['data_base64'])))
 sources={'replay_trace':Consumer(trace_records),'replay_control':Consumer(control_records)}
 transport.open_consumer=lambda group_file,topic_name,**kwargs:(None,sources[topic_name])
-continuous.BufferedTraceConsumer=lambda source:source
+# v4.0.8+ passes prepare/idle_wait_ms for the native background drainer.
+# Immutable replay bypasses that drainer and keeps native synchronous normalization.
+continuous.BufferedTraceConsumer=lambda source, **options:source
 shm_io.ring_totals=lambda:{'replay_trace':(report['rings']['trace']['written'],report['rings']['trace']['dropped']+report['rings']['trace']['unclaimed'])}
 # Use the recorded host as the native fact identity, never the replay machine.
 import dftracer.analyzer.analyzer as analyzer_module
