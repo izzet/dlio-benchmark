@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """DLIO-only project entry point; install after the real agent's bootstrap."""
 import sys
+import os
 import pathlib
 import node_agent
 
-assert pathlib.Path(node_agent.__file__).resolve() == pathlib.Path("/p/vast1/izzet/lfmr/liveflow-campaign-v4.0.6-agentperf-20261010/source/liveflow_shm/python/node_agent.py")
+runtime_root = pathlib.Path(os.environ.get(
+    "DLIO_RUNTIME_ROOT", "/p/vast1/izzet/lfmr/liveflow-campaign-v4.0.6-agentperf-20261010"))
+assert pathlib.Path(node_agent.__file__).resolve() == (runtime_root / "source/liveflow_shm/python/node_agent.py").resolve()
 
 
 def main():
