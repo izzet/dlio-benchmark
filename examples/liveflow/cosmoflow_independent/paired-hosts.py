@@ -7,11 +7,12 @@ def exclude(root,arm,host,minimum=14):
  hosts=(root/'hosts.txt').read_text().splitlines();assert len(hosts)==16 and len(set(hosts))==16
  assert host in hosts and 14<=minimum<=16
  directory=root/arm/host;failure=directory/'app-failure.json'
- reason=runner.fatal_line((directory/'dlio.log').read_text(errors='replace')) if (directory/'dlio.log').exists() else None
+ text=(directory/'dlio.log').read_text(errors='replace') if (directory/'dlio.log').exists() else ''
+ reason=runner.pair_exclusion_reason(text)
  if not reason or not failure.exists():raise ValueError('non-native or unrecorded failure; block must stop')
  output=root/'excluded-hosts.json';records=json.loads(output.read_text()) if output.exists() else []
  if host not in {r['host'] for r in records}:
-  records.append(dict(host=host,failed_arm=arm,reason=reason,failure=json.loads(failure.read_text()),unix_s=time.time(),policy='exclude same host from all arms in this block; retain all raw data'))
+  records.append(dict(host=host,failed_arm=arm,reason=reason,failure_class='native_crash' if runner.fatal_line(text) else 'hdf5_filter_read_error',failure=json.loads(failure.read_text()),unix_s=time.time(),policy='exclude same host from all arms in this block; retain all raw data'))
  output.write_text(json.dumps(records,indent=2)+'\n')
  eligible=[h for h in hosts if h not in {r['host'] for r in records}]
  (root/'paired-hosts.txt').write_text(''.join(h+'\n' for h in eligible))

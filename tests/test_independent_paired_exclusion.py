@@ -31,4 +31,24 @@ class Tests(unittest.TestCase):
  def test_duplicate_reports_do_not_drop_another_pair(self):
   with tempfile.TemporaryDirectory() as tmp:
    root=self.prepare(tmp);self.failure(root,'original','h0');policy.exclude(root,'original','h0');self.assertEqual(len(policy.exclude(root,'original','h0')),15)
+ def test_exact_terminal_hdf5_filter_error_excludes_same_pair(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   root=self.prepare(tmp);self.failure(root,'maxresource-adapted','h0',False)
+   d=root/'maxresource-adapted/h0'
+   (d/'dlio.log').write_text('OSError: Caught OSError in DataLoader worker process 2.\nOriginal Traceback (most recent call last):\n'+policy.runner.HDF5_FILTER_FAILURE+'\nflux-job: task(s) exited with exit code 1\n')
+   self.assertEqual(len(policy.exclude(root,'maxresource-adapted','h0')),15)
+   record=json.loads((root/'excluded-hosts.json').read_text())[0]
+   self.assertEqual(record['failure_class'],'hdf5_filter_read_error')
+   self.assertEqual(record['host'],'h0')
+ def test_other_worker_oserrors_and_filter_mentions_stop(self):
+  cases=['OSError: Caught OSError in DataLoader worker process 2.\nOSError: disk read failed',
+         'OSError: Caught OSError in DataLoader worker process 2.\n'+policy.runner.HDF5_FILTER_FAILURE+' extra text',
+         'warning: '+policy.runner.HDF5_FILTER_FAILURE,
+         policy.runner.HDF5_FILTER_FAILURE]
+  for text in cases:
+   with self.subTest(text=text),tempfile.TemporaryDirectory() as tmp:
+    root=self.prepare(tmp);self.failure(root,'original','h0',False)
+    (root/'original/h0/dlio.log').write_text(text)
+    with self.assertRaisesRegex(ValueError,'non-native'):policy.exclude(root,'original','h0')
+    self.assertFalse((root/'excluded-hosts.json').exists())
 if __name__=='__main__':unittest.main()

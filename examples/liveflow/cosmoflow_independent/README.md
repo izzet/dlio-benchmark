@@ -52,15 +52,22 @@ Host-scoped Flux jobs use exit-on-error and a5s exit timeout. An application
 fatal-log monitor cancels only that host's nested job, records its failure and
 retains partial traces. Other hosts finish the current arm. Native crashed hosts are excluded from every arm in their block, with raw data
 retained and failure/exclusion records disclosed. At least14of16 hosts must remain
-paired; otherwise the block stops as invalid. Non-native/unrecorded failures stop
-the block. DLIO_EXCLUDE_CRASHED_HOSTS=0 requests strict stop-on-any-failure.
+paired; otherwise the block stops as invalid. The user-approved exact terminal
+`OSError: Can't synchronously read data (filter returned failure during read)`
+in a DataLoader-worker OSError traceback also excludes that whole host pair;
+records distinguish it from a native crash. Other exceptions and unrecorded
+failures stop the block. DLIO_EXCLUDE_CRASHED_HOSTS=0 requests strict stop-on-any-failure.
 These exclusions can bias host selection and must be reported per block.
 No script here automatically submits the next block or authorizes a campaign.
 
 Run only after the orchestrator releases the allocation and any storage hold:
 set DLIO_CAMPAIGN_ROOT to an absolute output directory outside the clean checkout,
 then submit independent-campaign-block.sh BLOCK using the project's Flux batch
-allocation with16hosts/128tasks/6cores. Blocks rotate the four arm order and each
+allocation with16hosts/128tasks/6cores. All DLIO allocations must use
+`--requires=-host:corona265`: the suspected node had two failures on rank6,
+with no causal hardware diagnosis. `flux batch --dry-run` parses this constraint
+as `{"not":[{"hostlist":["corona265"]}]}` without allocating resources.
+Blocks rotate the four arm order and each
 arm uses five4096-step epochs (20480steps/rank). LF targets10s with frozen K and
 geometric worker raises; legal worker values1..12 avoid range coarsening.
 Static replays run after all timed arms. Report scripts retain per-host elapsed,

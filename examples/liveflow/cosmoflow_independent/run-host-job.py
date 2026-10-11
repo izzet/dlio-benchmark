@@ -9,9 +9,21 @@ import subprocess
 import time
 
 FATAL = re.compile(r'unsorted double linked list corrupted|Unexpected segmentation fault|Segmentation fault|signal 11|Bus error|DataLoader worker.*(?:killed|exited unexpectedly)', re.I)
+HDF5_FILTER_FAILURE = "OSError: Can't synchronously read data (filter returned failure during read)"
 
 def fatal_line(text):
     return next((line for line in text.splitlines() if FATAL.search(line)), None)
+
+def pair_exclusion_reason(text):
+    """User-approved allowlist: native crash or exact terminal HDF5 filter error."""
+    native = fatal_line(text)
+    if native:
+        return native
+    lines = text.splitlines()
+    worker_exception = any(re.fullmatch(r'OSError: Caught OSError in DataLoader worker process \d+\.', line.strip()) for line in lines)
+    if worker_exception:
+        return next((line for line in lines if line.strip() == HDF5_FILTER_FAILURE), None)
+    return None
 
 def record_failure(directory, host, kind, jobid, reason, returncode=None):
     record = dict(unix_s=time.time(), host=host, kind=kind, nested_jobid=jobid,
@@ -71,7 +83,7 @@ def main():
     rc = attach.wait()
     if detected and rc == 0: rc = 1
     if rc and not (directory / f'{args.kind}-failure.json').exists():
-        reason = fatal_line(logfile.read_text(errors='replace')) if logfile.exists() else None
+        reason = pair_exclusion_reason(logfile.read_text(errors='replace')) if logfile.exists() else None
         record_failure(directory, args.host, args.kind, jobid, reason or 'nested job exited unsuccessfully', rc)
     return rc
 
