@@ -34,6 +34,14 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
+# StatsCounter imports MPI at module scope, before main() initializes DLIOMPI.
+# Isolate MPI polling threads before any DLIO import can trigger that import.
+if (os.environ.get("LIVEFLOW_WORKLOAD") == "dlio-pytorch"
+        and os.environ.get("LIVEFLOW_DLIO_HDF5_DECODE") == "1"):
+    import importlib
+    from dlio_benchmark.utils.liveflow_worker_lifecycle import initialize_mpi
+    initialize_mpi(lambda: importlib.import_module("mpi4py.MPI"))
+
 from dlio_benchmark.checkpointing.checkpointing_factory import CheckpointingFactory
 from dlio_benchmark.common.constants import MODULE_DLIO_BENCHMARK
 from dlio_benchmark.common.enumerations import DataLoaderType, DatasetType, MetadataType
