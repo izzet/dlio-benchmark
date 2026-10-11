@@ -1,4 +1,5 @@
 #!/bin/bash
 set -euo pipefail
-OWN=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+OWN=${DLIO_CAMPAIGN_CHECKOUT:?Set the pinned DLIO checkout}/examples/liveflow/cosmoflow_independent
+[[ -d $OWN ]]
 python3 -u "$OWN/forkserver-test.py"
