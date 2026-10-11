@@ -94,7 +94,11 @@ for armname in sorted({v['arm'] for v in results.values()}):
  aggregate[armname]=a
 exclusions=json.loads((root/'excluded-hosts.json').read_text()) if (root/'excluded-hosts.json').exists() else []
 if paired is not None:
- for armname in ['original','maxresource-adapted','static-best','liveflow']:
+ order_file=root/'order.txt'
+ expected_arms=order_file.read_text().splitlines() if order_file.exists() else ['original','maxresource-adapted','static-best','liveflow']
+ assert expected_arms and len(set(expected_arms))==len(expected_arms)
+ assert set(expected_arms)<= {'original','maxresource-adapted','static-best','liveflow'}
+ for armname in expected_arms:
   assert {v['host'] for v in results.values() if v['arm']==armname}==paired,('incomplete paired arm',armname)
 output=dict(paired_hosts=sorted(paired) if paired is not None else None,excluded_hosts=exclusions,per_host=results,aggregate=aggregate,replications=1,scope='one paired campaign block; hosts are not campaign repetitions',epochs=epochs,steps_per_epoch=nsteps)
 (root/'block-results.json').write_text(json.dumps(output,indent=2)+'\n')
