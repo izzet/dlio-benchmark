@@ -23,6 +23,7 @@ from torch.utils.data.sampler import Sampler
 from dlio_benchmark.common.constants import MODULE_DATA_LOADER
 from dlio_benchmark.common.enumerations import DatasetType, DataLoaderType
 from dlio_benchmark.data_loader.base_data_loader import BaseDataLoader
+from dlio_benchmark.data_loader.consumer_iterator import traced_consumer_batches
 from dlio_benchmark.data_loader.torch_data_loader import TorchDataset
 from dlio_benchmark.utils.utility import utcnow, Profile, dft_ai, maybe_inject_fetch_delay
 from dlio_benchmark.utils.config import ConfigArguments
@@ -86,6 +87,7 @@ class LiveDataLoader(BaseDataLoader):
         self._prefetch_size = 2
         self._samples_yielded = 0
         self._pending_reconfigure = None
+        self._consumer_boundary = None
 
     def _build_inner(self):
         """Build the inner PyTorch DataLoader with current settings."""
@@ -269,7 +271,8 @@ class LiveDataLoader(BaseDataLoader):
 
             inner_iter = iter(self._inner)
             _mot.wrap_get_data(inner_iter)
-            for batch in dft_ai.dataloader.fetch.iter(_mot.observe(inner_iter, self.epoch_number, step - 1)):
+            for batch in traced_consumer_batches(
+                    _mot.observe(inner_iter, self.epoch_number, step - 1), owner=self):
                 maybe_inject_fetch_delay(
                     self.logger,
                     location=f"{self.__class__.__qualname__}.next",
@@ -288,6 +291,20 @@ class LiveDataLoader(BaseDataLoader):
         self.epoch_number += 1
         dlp.update(epoch=self.epoch_number)
         dft_ai.update(epoch=self.epoch_number)
+
+    def last_step_wait_s(self):
+        """Combined parent fetch wait; includes queueing, read and decode."""
+        return None if self._consumer_boundary is None else self._consumer_boundary.last_wait_seconds
+
+    def emit_window_stall(self, epoch, step):
+        if self._consumer_boundary is None:
+            return 0.0
+        return self._consumer_boundary.emit_window_stall(epoch, step)
+
+    def drain_step_stalls(self):
+        if self._consumer_boundary is None:
+            return []
+        return self._consumer_boundary.drain_step_stalls()
 
     @dlp.log
     def finalize(self):

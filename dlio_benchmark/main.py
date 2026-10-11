@@ -1115,7 +1115,7 @@ class DLIOBenchmark(object):
                 _last_wait = getattr(loader, "last_step_wait_s", None)
                 _wait_s = _last_wait() if callable(_last_wait) else None
                 if _wait_s is not None and hasattr(self._window, "note_step_exposure"):
-                    self._window.note_step_exposure(storage=_wait_s)     # this step's exposed input wait
+                    self._window.note_step_exposure(input=_wait_s)     # combined fetch wait, not pure storage/decode
                 if self._window_will_close():
                     if not job_input.enabled():
                         _drain = getattr(loader, "drain_step_stalls", None)

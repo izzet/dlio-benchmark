@@ -238,6 +238,10 @@ class TorchDataLoader(BaseDataLoader):
         dlp.update(epoch=self.epoch_number)
         dft_ai.update(epoch=self.epoch_number)
 
+    def last_step_wait_s(self):
+        """Combined parent fetch wait; includes queueing, read and decode."""
+        return None if self._consumer_boundary is None else self._consumer_boundary.last_wait_seconds
+
     def emit_window_stall(self, epoch, step):
         if self._consumer_boundary is None:
             return 0.0
