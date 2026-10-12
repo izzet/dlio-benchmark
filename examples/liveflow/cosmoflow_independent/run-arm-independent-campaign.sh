@@ -70,6 +70,7 @@ else
  unset DLIO_LF_ISOLATE_CORES LIVEFLOW_AGENT_CPUSET
 fi
 printf 'core_isolation=%s\n' "${DLIO_LF_ISOLATE_CORES:-0}" >> "$RUN_DIR/config.txt"
+printf 'lean_worker_records=%s\n' "${DLIO_LEAN_WORKER_RECORDS:-0}" >> "$RUN_DIR/config.txt"
 # Record derived affinity variables after host-specific topology discovery.
 env | sort | rg '^(DLIO_LF_ISOLATE_CORES=|LIVEFLOW_AGENT_CPUSET=)' >> "$RUN_DIR/runtime-env.txt" || true
 agent_pid=''
