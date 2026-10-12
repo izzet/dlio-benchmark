@@ -62,9 +62,11 @@ shm_io.ring_totals=lambda:{'replay_trace':(report['rings']['trace']['written'],r
 # Use the recorded host as the native fact identity, never the replay machine.
 import dftracer.analyzer.analyzer as analyzer_module
 analyzer_module.socket=types.SimpleNamespace(gethostname=lambda:host)
-cfg=types.SimpleNamespace(data_folder='/p/lustre3/izzet/dlio-benchmark-test/cosmoflow_official_validation_32768_20261010/data',checkpoint_folder=None,hydra_dir=str(out),preset='liveflow-v1',debug=True,workers=1,trace_topic='replay_trace',control_topic='replay_control',window_topic='replay_unused',view_types='[window,proc_name]',facts_rule_file='',fact_source_view='')
+recorded_config=dict(line.split('=',1) for line in (arm/'config.txt').read_text().splitlines() if '=' in line)
+data_folder=recorded_config.get('data_root','/p/lustre3/izzet/dlio-benchmark-test/cosmoflow_official_validation_32768_20261010/data')
+cfg=types.SimpleNamespace(data_folder=data_folder,checkpoint_folder=None,hydra_dir=str(out),preset='liveflow-v1',debug=True,workers=1,trace_topic='replay_trace',control_topic='replay_control',window_topic='replay_unused',view_types='[window,proc_name]',facts_rule_file='',fact_source_view='')
 dfa=node_agent.build_analyzer(cfg)
-provenance=dict(mode='native timestamp fence replay; original batch-count targets set to0 on replay copy only',host=host,runtime=os.environ.get('LIVEFLOW_SNAPSHOT_ROOT'),raw_event_count=len(events),control_record_count=len(controls),collector=report,original_controls=str(arm/f'control-{host}.jsonl'),native_rank_step_and_trace_integrity='enabled',ring_totals_source='recorded raw-drain node counters, measured zero drops')
+provenance=dict(data_folder=data_folder,data_pool=recorded_config.get('data_pool','original'),mode='native timestamp fence replay; original batch-count targets set to0 on replay copy only',host=host,runtime=os.environ.get('LIVEFLOW_SNAPSHOT_ROOT'),raw_event_count=len(events),control_record_count=len(controls),collector=report,original_controls=str(arm/f'control-{host}.jsonl'),native_rank_step_and_trace_integrity='enabled',ring_totals_source='recorded raw-drain node counters, measured zero drops')
 (out/'replay-provenance.json').write_text(json.dumps(provenance,indent=2)+'\n')
 from omegaconf import OmegaConf
 dfa.analyzer.analyze_mofka(group_file='',topic_name='replay_trace',control_topic_name='replay_control',view_types=['window','proc_name'],logical_view_types=dfa.hydra_config.logical_view_types,metric_boundaries=OmegaConf.to_object(dfa.hydra_config.metric_boundaries),trace_drain_grace_ms=100,process_key='pid',extra_columns=node_agent.LIVE_WINDOW_EXTRA_COLUMNS,output_handler=lambda result:None,num_ranks=8)
