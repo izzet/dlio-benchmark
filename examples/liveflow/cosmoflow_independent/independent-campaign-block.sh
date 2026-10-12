@@ -3,6 +3,7 @@
 set -euo pipefail
 OWN=${DLIO_CAMPAIGN_CHECKOUT:?Set the pinned DLIO checkout}/examples/liveflow/cosmoflow_independent
 [[ -d $OWN ]]
+case ${DLIO_DEFER_REPLAY:-0} in 0|1) ;; *) echo 'DLIO_DEFER_REPLAY must be 0 or 1' >&2;exit 2;;esac
 block=${1:?}
 DLIO_STATIC_W=${DLIO_STATIC_W:-12};DLIO_STATIC_P=${DLIO_STATIC_P:-2}
 export DLIO_STATIC_W DLIO_STATIC_P
@@ -46,6 +47,13 @@ for arm in "${arms[@]}";do
  [[ $rc == 0 ]] || exit 1
  printf '%s complete\n' "$arm"
 done
+# Application wrappers have already finished EOS, drain, postflight and cleanup.
+# Retain the same raw traces for replay with this checkout/runtime after release.
+if [[ ${DLIO_DEFER_REPLAY:-0} == 1 ]];then
+ printf 'checkout=%s\nruntime=%s\narms=original maxresource-adapted static-best\n' \
+  "$DLIO_CAMPAIGN_CHECKOUT" "${DLIO_RUNTIME_ROOT:?}" > "$ROOT/replay-deferred.txt"
+ exit 0
+fi
 # Parallel static replays: at most three single-worker analyses per host,
 # only after all timed application arms finish. LF facts were made natively.
 pids=()
