@@ -17,6 +17,7 @@ class PoolSelectionTests(unittest.TestCase):
         for i, arm in enumerate(self.arms):
             root = pathlib.Path(self.tmp.name) / f'C{i}'
             (root / 'train').mkdir(parents=True)
+            (root / 'valid').mkdir()
             self.assignments[arm] = dict(pool=f'C{i}', data_root=str(root))
         self.config = dict(blocks={'1': self.assignments})
 
@@ -43,6 +44,12 @@ class PoolSelectionTests(unittest.TestCase):
     def test_missing_train_directory_rejected(self):
         pathlib.Path(self.assignments['liveflow']['data_root'], 'train').rmdir()
         with self.assertRaises(ValueError):
+            pools.select(self.config, 1, 'original')
+
+    def test_missing_empty_valid_directory_rejected_before_any_arm(self):
+        pathlib.Path(self.assignments['liveflow']['data_root'], 'valid').rmdir()
+        # Fail early even when selecting an unaffected pool.
+        with self.assertRaisesRegex(ValueError, 'train and valid'):
             pools.select(self.config, 1, 'original')
 
 if __name__ == '__main__':

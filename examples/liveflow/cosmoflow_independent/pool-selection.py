@@ -15,8 +15,9 @@ def select(config, block, arm):
     roots = [pathlib.Path(v['data_root']).resolve(strict=True) for v in assignments.values()]
     if len(set(labels)) != 4 or len(set(roots)) != 4:
         raise ValueError('Each arm in a block must have a different pool')
-    if not all(p.is_absolute() and (p/'train').is_dir() for p in roots):
-        raise ValueError('Every pool must contain a train directory')
+    # DLIO initializes both split directories even with num_files_eval=0.
+    if not all(p.is_absolute() and all((p/split).is_dir() for split in ('train', 'valid')) for p in roots):
+        raise ValueError('Every pool must contain train and valid directories')
     chosen = assignments[arm]
     return chosen['pool'], str(pathlib.Path(chosen['data_root']).resolve(strict=True))
 
