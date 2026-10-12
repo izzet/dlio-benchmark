@@ -31,6 +31,11 @@ case "$block" in
 esac
 printf '%s\n' "${arms[@]}" > "$ROOT/order.txt"
 for arm in "${arms[@]}";do
+ if [[ -n ${DLIO_POOL_CONFIG:-} ]];then
+  mapfile -t selected < <(python3 "$OWN/pool-selection.py" "$DLIO_POOL_CONFIG" "$block" "$arm")
+  [[ ${#selected[@]} == 2 ]] || { echo 'Invalid campaign data pool selection' >&2;exit 1; }
+  export DLIO_DATA_POOL=${selected[0]} DLIO_DATA_ROOT=${selected[1]}
+ fi
  pids=();mapfile -t paired < "$ROOT/paired-hosts.txt"
  for host in "${paired[@]}";do
   bash "$OWN/run-arm-independent-campaign.sh" "$ROOT/$arm/$host" "$arm" "$host" > "$ROOT/$arm-$host-launch.log" 2>&1 &

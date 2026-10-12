@@ -29,7 +29,8 @@ if [[ ${LIVEFLOW_MOTIVATION_TIMERS:-0} == 1 ]];then
  export LIVEFLOW_MOTIVATION_OUTPUT_DIR="$RUN_DIR/motivation-timers"
  [[ -f "$DLIO_APP_ROOT/dlio_benchmark/data_loader/motivation_timers.py" ]] || { echo 'Committed DLIO motivation timers missing';exit 1; }
 fi
-DATA=/p/lustre3/izzet/dlio-benchmark-test/cosmoflow_official_validation_32768_20261010/data
+DATA=${DLIO_DATA_ROOT:-/p/lustre3/izzet/dlio-benchmark-test/cosmoflow_official_validation_32768_20261010/data}
+[[ -d "$DATA/train" ]] || { echo "Missing DLIO data pool: $DATA/train" >&2;exit 1; }
 prefix="dlio_smoke_${ARM}_$(date +%s)_$$"
 export LIVEFLOW_SHM_PREFIX=$prefix DFTRACER_SHM_PREFIX=$prefix
 export LIVEFLOW_SHM_LANES=2048 DFTRACER_SHM_LANES=2048
@@ -54,6 +55,7 @@ case "$ARM" in
  *) exit 2 ;;
 esac
 printf 'arm=%s\nprefix=%s\nruntime=%s\ndlio_commit=%s\nanalysis=static raw-only offline analysis; LiveFlow native online node-local agent\ncache=advisory cold own rank shard before each epoch; first20 steps per epoch excluded; campaign\n' "$ARM" "$prefix" "$FREEZE" "$DLIO_COMMIT" > "$RUN_DIR/config.txt"
+printf 'data_root=%s\ndata_pool=%s\n' "$DATA" "${DLIO_DATA_POOL:-original}" >> "$RUN_DIR/config.txt"
 # Record relevant task settings, not login environment/secrets.
 env | sort | rg '^(LIVEFLOW_|DFTRACER_|DFOPTIMIZER_|DLIO_|IBV_FORK_SAFE=|RDMAV_FORK_SAFE=|MV2_SUPPORT_FORK_SAFETY=|OMP_|MKL_|OPENBLAS_|PYTHONPATH=|LD_LIBRARY_PATH=|PYTHONFAULTHANDLER=)' > "$RUN_DIR/runtime-env.txt"
 appy="$VENV_DLIO/bin/python";agentpy="$LIVEFLOW_AGENT_VENV_DIR/bin/python"
