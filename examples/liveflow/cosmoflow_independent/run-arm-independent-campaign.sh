@@ -57,15 +57,17 @@ printf 'arm=%s\nprefix=%s\nruntime=%s\ndlio_commit=%s\nanalysis=static raw-only 
 # Record relevant task settings, not login environment/secrets.
 env | sort | rg '^(LIVEFLOW_|DFTRACER_|DFOPTIMIZER_|DLIO_|IBV_FORK_SAFE=|RDMAV_FORK_SAFE=|MV2_SUPPORT_FORK_SAFETY=|OMP_|MKL_|OPENBLAS_|PYTHONPATH=|LD_LIBRARY_PATH=|PYTHONFAULTHANDLER=)' > "$RUN_DIR/runtime-env.txt"
 appy="$VENV_DLIO/bin/python";agentpy="$LIVEFLOW_AGENT_VENV_DIR/bin/python"
-# LF pays for two dedicated physical agent cores. Comparators retain shipped masks.
-if [[ "$ARM" == liveflow ]];then
- export DLIO_LF_ISOLATE_CORES=2
+# Isolation is an opt-in diagnostic deployment; default LF shares the shipped node.
+case ${DLIO_LF_ISOLATE_CORES:-0} in 0|2) ;; *) echo 'DLIO_LF_ISOLATE_CORES must be 0 or 2' >&2;exit 2;;esac
+if [[ "$ARM" == liveflow && ${DLIO_LF_ISOLATE_CORES:-0} == 2 ]];then
+ export DLIO_LF_ISOLATE_CORES
  LIVEFLOW_AGENT_CPUSET=$(hostrun "$agentpy" "$OWN/dlio_cpu_affinity.py" --output "$RUN_DIR/core-isolation.json")
  export LIVEFLOW_AGENT_CPUSET
  [[ -n "$LIVEFLOW_AGENT_CPUSET" ]]
 else
  unset DLIO_LF_ISOLATE_CORES LIVEFLOW_AGENT_CPUSET
 fi
+printf 'core_isolation=%s\n' "${DLIO_LF_ISOLATE_CORES:-0}" >> "$RUN_DIR/config.txt"
 # Record derived affinity variables after host-specific topology discovery.
 env | sort | rg '^(DLIO_LF_ISOLATE_CORES=|LIVEFLOW_AGENT_CPUSET=)' >> "$RUN_DIR/runtime-env.txt" || true
 agent_pid=''
